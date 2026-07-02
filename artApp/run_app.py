@@ -14,6 +14,7 @@ ArtPipeline Studio · 桌面壳（发布 / .app 打包入口）
 from __future__ import annotations
 
 import argparse
+import os
 import socket
 import sys
 import threading
@@ -92,6 +93,50 @@ def _wait_for_http(url: str, *, timeout_sec: float = 12.0) -> bool:
     return False
 
 
+def _ui_url_candidates(host: str, port: int) -> list[str]:
+    """WKWebView 在部分 macOS 上对 localhost / 127.0.0.1 行为不一致，准备备用地址。"""
+    primary = f"http://{host}:{port}"
+    urls = [primary]
+    alt_host = "localhost" if host in ("127.0.0.1", "::1") else "127.0.0.1"
+    alt = f"http://{alt_host}:{port}"
+    if alt not in urls:
+        urls.append(alt)
+    return urls
+
+
+def _attach_webview_watchdog(window, urls: list[str]) -> None:
+    """若导航失败，pywebview 窗口会只剩背景色；定时重试备用 URL。"""
+    state = {"idx": 0}
+
+    def on_loaded() -> None:
+        _log_startup(f"webview loaded: {urls[state['idx']]}")
+
+    window.events.loaded += on_loaded
+
+    def watch() -> None:
+        time.sleep(2.5)
+        for attempt in range(len(urls) * 2):
+            if window.events.loaded.is_set():
+                try:
+                    title = window.evaluate_js("document.title || ''")
+                    if title:
+                        _log_startup(f"webview document.title={title}")
+                        return
+                except Exception:
+                    return
+            state["idx"] = (state["idx"] + 1) % len(urls)
+            next_url = urls[state["idx"]]
+            _log_startup(f"webview blank/retry #{attempt + 1} -> {next_url}")
+            try:
+                window.load_url(next_url)
+            except Exception as exc:
+                _log_startup(f"webview load_url failed: {exc}")
+            time.sleep(2.5)
+        _log_startup("webview load gave up after retries")
+
+    threading.Thread(target=watch, daemon=True, name="webview-watch").start()
+
+
 def _show_fatal(message: str) -> None:
     _log_startup(f"FATAL: {message}")
     if sys.platform == "darwin":
@@ -114,6 +159,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="ArtPipeline Studio desktop shell")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="启用 pywebview 调试（或设置环境变量 ARTPIPELINE_DEBUG=1）",
+    )
     args = parser.parse_args()
 
     try:
@@ -151,15 +201,20 @@ def main() -> None:
         _show_fatal(f"界面资源加载失败：{url}")
         raise SystemExit(1)
 
-    webview.create_window(
+    ui_urls = _ui_url_candidates(args.host, port)
+    window = webview.create_window(
         APP_TITLE,
-        url,
+        ui_urls[0],
         width=1280,
         height=990,
         min_size=(720, 520),
         background_color="#06080d",
     )
-    webview.start()
+    _attach_webview_watchdog(window, ui_urls)
+    debug = args.debug or bool(os.environ.get("ARTPIPELINE_DEBUG"))
+    if debug:
+        _log_startup("webview debug=on")
+    webview.start(debug=debug, private_mode=False)
 
 
 if __name__ == "__main__":

@@ -272,15 +272,15 @@
               <div class="gen-tab-panel">
                 <label class="gen-field">
                   <span data-i18n="form.sourcePath">source</span>
-                  <input name="source" autocomplete="off" spellcheck="false" />
+                  <input name="source" autocomplete="off" spellcheck="false" data-path-field data-path-kind="dir" data-path-base="art" />
                 </label>
                 <label class="gen-field">
                   <span data-i18n="form.inboxPath">inbox</span>
-                  <input name="inbox" autocomplete="off" spellcheck="false" />
+                  <input name="inbox" autocomplete="off" spellcheck="false" data-path-field data-path-kind="dir" data-path-base="art" />
                 </label>
                 <label class="gen-field">
                   <span data-i18n="form.enginePath">游戏引擎</span>
-                  <input name="unity" autocomplete="off" spellcheck="false" />
+                  <input name="unity" autocomplete="off" spellcheck="false" data-path-field data-path-kind="dir" data-path-base="project" />
                 </label>
               </div>
             </section>
@@ -367,11 +367,13 @@
                         type="text"
                         id="ref-image-path"
                         class="ref-path-input"
+                        data-path-field
+                        data-path-kind="file"
+                        data-path-base="art"
                         data-i18n-placeholder="form.refImagePlaceholder"
                         placeholder="相对 ArtPipeline 或绝对路径"
                         spellcheck="false"
                       />
-                      <button type="button" class="ref-path-browse" data-action="pick-ref-image" data-i18n="form.pickRefImage">浏览…</button>
                     </div>
                   </div>
                   <div id="redraw-source-section" class="ref-path-block ref-path-readonly hidden">
@@ -498,8 +500,7 @@
                       <span class="ref-path-title" data-i18n="form.refImage">参考图</span>
                     </div>
                     <div class="ref-path-picker">
-                      <input type="text" id="cloud-ref-image-path" class="ref-path-input" data-i18n-placeholder="form.refImagePlaceholder" spellcheck="false" />
-                      <button type="button" class="ref-path-browse" data-action="pick-cloud-ref-image" data-i18n="form.pickRefImage">浏览…</button>
+                      <input type="text" id="cloud-ref-image-path" class="ref-path-input" data-path-field data-path-kind="file" data-path-base="art" data-i18n-placeholder="form.refImagePlaceholder" spellcheck="false" />
                     </div>
                   </div>
                   <div id="cloud-edit-source-section" class="ref-path-block ref-path-readonly hidden">
@@ -563,6 +564,7 @@
                   <button type="button" class="ai-mode-tab radio-seg-item" data-ai-mode="refine" role="tab" data-i18n="ai.mode.refine">优化调整</button>
                   <button type="button" class="ai-mode-tab radio-seg-item" data-ai-mode="workflow" role="tab" data-i18n="ai.mode.workflow">工作流</button>
                   <button type="button" class="ai-mode-tab radio-seg-item" data-ai-mode="basic" role="tab" data-i18n="ai.mode.basic">写基本信息</button>
+                  <button type="button" class="ai-mode-tab radio-seg-item" data-ai-mode="category" role="tab" data-i18n="ai.mode.category">分类设置</button>
                 </nav>
                 <p class="ai-mode-hint settings-hint muted sm" id="ai-mode-hint"></p>
                 <div class="ai-messages" id="ai-history"></div>
@@ -598,11 +600,11 @@
               <div class="settings-panel">
                 <label class="settings-field">
                   <span data-i18n="form.projectRoot">游戏引擎项目根</span>
-                  <input name="project_root" autocomplete="off" spellcheck="false" />
+                  <input name="project_root" autocomplete="off" spellcheck="false" data-path-field data-path-kind="dir" data-path-base="absolute" />
                 </label>
                 <label class="settings-field">
                   <span data-i18n="form.artRoot">ArtPipeline 根</span>
-                  <input name="art_pipeline_root" autocomplete="off" spellcheck="false" />
+                  <input name="art_pipeline_root" autocomplete="off" spellcheck="false" data-path-field data-path-kind="dir" data-path-base="absolute" />
                 </label>
                 <div class="settings-panel-actions">
                   <button type="button" class="btn sm ghost" data-action="autodetect-paths" data-i18n="form.autodetectPaths">自动检测路径</button>
@@ -610,7 +612,7 @@
                 <div class="settings-panel-divider" aria-hidden="true"></div>
                 <label class="settings-field">
                   <span data-i18n="form.logDir">运行日志目录</span>
-                  <input name="log_dir" placeholder="" autocomplete="off" spellcheck="false" />
+                  <input name="log_dir" placeholder="" autocomplete="off" spellcheck="false" data-path-field data-path-kind="dir" data-path-base="absolute" data-path-optional />
                 </label>
                 <p class="settings-hint muted sm" id="log-dir-hint"></p>
                 <div class="settings-panel-actions">
@@ -874,7 +876,11 @@
     <div class="job-float-aura" aria-hidden="true"></div>
     <div class="job-float-card">
       <div class="job-float-head" id="job-float-handle" data-i18n-title="job.floatDrag" title="拖动移动">
-        <div class="job-float-ring" aria-hidden="true"><span></span></div>
+        <div class="job-float-ring" aria-hidden="true">
+          <span class="job-float-ring-inner">
+            <img class="job-float-ring-icon" src="/assets/app_icon.png" width="22" height="22" alt="" />
+          </span>
+        </div>
         <div class="job-float-copy">
           <div class="job-float-title" id="job-float-title" data-i18n="job.generating">生成中</div>
           <div class="job-float-file" id="job-float-file">—</div>
@@ -1088,6 +1094,8 @@
     <button type="button" class="ctx-item" data-ctx="rename" data-i18n="ctx.rename">重命名…</button>
     <button type="button" class="ctx-item" data-ctx="duplicate" data-i18n="ctx.duplicate">复制</button>
     <div class="ctx-sep" role="separator"></div>
+    <button type="button" class="ctx-item" data-ctx="remove-magenta" data-i18n="ctx.removeMagenta">去除洋红</button>
+    <button type="button" class="ctx-item" data-ctx="auto-trim" data-i18n="ctx.autoTrim">自适应裁切</button>
     <button type="button" class="ctx-item" data-ctx="postprocess" data-i18n="ctx.postprocess">后处理…</button>
     <div class="ctx-sep" role="separator"></div>
     <button type="button" class="ctx-item" data-ctx="open-source" data-i18n="ctx.openSource">打开 source 文件</button>

@@ -139,7 +139,7 @@ class Category:
     lora_strength: float = 0.7
     positive_common: str = ""
     negative_common: str = ""
-    alpha_matte: str = "border"
+    alpha_matte: str = "none"
 
 
 @dataclass
@@ -269,13 +269,28 @@ class ConfigManager:
 
     @staticmethod
     def _join_under(root: Path, rel: str) -> Path:
-        rel = rel.strip().replace("\\", "/").strip("/")
-        if not rel:
-            return root
-        p = Path(rel)
+        s = (rel or "").strip().replace("\\", "/")
+        if not s:
+            return root.resolve()
+        p = Path(s).expanduser()
         if p.is_absolute():
-            return p.expanduser().resolve()
-        return (root / rel).resolve()
+            return p.resolve()
+        # 旧版 strip("/") 会把 /Users/... 存成 Users/...，导出时误拼到项目根下
+        if s.startswith("Users/") or s.startswith("Volumes/"):
+            legacy = Path("/") / s
+            return legacy.expanduser().resolve()
+        rel_part = s.strip("/")
+        if not rel_part:
+            return root.resolve()
+        return (root / rel_part).resolve()
+
+    def normalize_category_path(self, raw: str, *, under: str) -> str:
+        """将分类路径规范为绝对路径（source/inbox→art 根，unity→项目根）。"""
+        s = (raw or "").strip()
+        if not s:
+            return s
+        root = self.art_root() if under == "art" else self.project_root()
+        return str(self._join_under(root, s))
 
     def category_source_path(self, cat: Category) -> Path:
         return self._join_under(self.art_root(), cat.source)
@@ -327,7 +342,7 @@ class ConfigManager:
                     negative_common=str(
                         raw.get("negative_common", CATEGORY_NEGATIVE_COMMON)
                     ),
-                    alpha_matte=str(raw.get("alpha_matte", "border" if raw.get("id") not in NO_TRANSPARENT_CATEGORIES else "none")),
+                    alpha_matte=str(raw.get("alpha_matte", "none")),
                 )
             )
         self._categories_cache = out
@@ -429,7 +444,7 @@ class ConfigManager:
             checkpoint=ckpt,
             positive_common=CATEGORY_POSITIVE_COMMON,
             negative_common=CATEGORY_NEGATIVE_COMMON,
-            alpha_matte="border",
+            alpha_matte="none",
         )
         self.data.setdefault("categories", []).append(cat.__dict__)
         self.ensure_category_dirs(cat)

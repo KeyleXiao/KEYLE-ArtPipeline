@@ -39,7 +39,7 @@ except ImportError:
 
 VIEW_MIN_ZOOM = 0.5
 VIEW_MAX_ZOOM = 8.0
-DEFAULT_VIEW_ZOOM = 3.0
+DEFAULT_VIEW_ZOOM = 1.0
 
 
 def open_postprocess_editor(
@@ -132,6 +132,45 @@ class PostprocessEditorWindow(tk.Toplevel):
         except tk.TclError:
             pass
 
+    def _align_canvas_to_subject_if_needed(self) -> bool:
+        """主体 PNG 与画布尺寸不一致时，对齐画布（默认变换）；单主体层时清除错误缩放/偏移。"""
+        from postprocess.models import layer_image_source
+
+        subj = self._stack.subject_layer()
+        if not subj or subj.type != "image":
+            return False
+        layers = self._stack.layers or []
+        single_subject = len(layers) == 1 and subj.is_subject
+        xf = subj.transform
+        default_layout = (
+            abs(float(xf.scale) - 1.0) < 1e-6
+            and abs(float(xf.offset_x)) < 1e-6
+            and abs(float(xf.offset_y)) < 1e-6
+            and abs(float(xf.rotation_deg)) < 1e-6
+            and not xf.flip_h
+            and not xf.flip_v
+            and not subj.crop
+        )
+        if not default_layout and not single_subject:
+            return False
+        raw = self._resolver().resolve(layer_image_source(subj))
+        if not raw:
+            return False
+        rw, rh = raw.size
+        changed = False
+        if rw != self._stack.canvas_width or rh != self._stack.canvas_height:
+            self._stack.canvas_width = rw
+            self._stack.canvas_height = rh
+            changed = True
+        if changed or (single_subject and not default_layout):
+            anchor = subj.transform.anchor
+            subj.crop = None
+            from postprocess.models import LayerTransform
+
+            subj.transform = LayerTransform(anchor=anchor)
+            changed = True
+        return changed
+
     def _deferred_editor_init(self) -> None:
         try:
             self._font_list = list_system_fonts()
@@ -139,15 +178,13 @@ class PostprocessEditorWindow(tk.Toplevel):
                 self._font_combo.configure(values=self._font_list[:80])
         except tk.TclError:
             pass
+        self._align_canvas_to_subject_if_needed()
         self._refresh_all()
         self.after(300, self._safe_page_refresh)
 
     def _load_initial_stack(self) -> LayerStack:
         existing = self.config_mgr.get_postprocess_stack(self.asset.id)
-        if existing and existing.layers:
-            existing.canvas_width = self.asset.width
-            existing.canvas_height = self.asset.height
-        else:
+        if not existing or not existing.layers:
             existing = self.config_mgr.default_postprocess_stack(self.asset)
         existing.ensure_subject_layer()
         for layer in existing.layers:

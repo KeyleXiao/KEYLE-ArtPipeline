@@ -11,6 +11,7 @@ from typing import Any, Protocol
 
 from PIL import Image, ImageDraw, ImageOps
 
+from postprocess.blend import apply_layer_tint, composite_layer, normalize_blend_mode
 from postprocess.fonts import load_pil_font
 from postprocess.models import (
     ASSET_SUBJECT_SOURCE,
@@ -137,7 +138,10 @@ def _clamp_pivot(value: float) -> float:
 
 
 def _normalized_rotation_deg(angle: float) -> float:
-    return float(angle) % 360.0
+    a = float(angle) % 360.0
+    if a > 180.0:
+        a -= 360.0
+    return a
 
 
 def _rotate_point(x: float, y: float, px: float, py: float, rad: float) -> tuple[float, float]:
@@ -157,7 +161,7 @@ def _transform_scaled_image(
     py = _clamp_pivot(transform.pivot_y) * sh
     local_corners = [(0.0, 0.0), (float(sw), 0.0), (float(sw), float(sh)), (0.0, float(sh))]
     angle = _normalized_rotation_deg(transform.rotation_deg)
-    if angle < 0.001 or angle > 359.999:
+    if abs(angle) < 0.001:
         return im, px, py, local_corners
 
     rad = math.radians(-angle)
@@ -193,7 +197,7 @@ def _canvas_corners_from_local(
     py = _clamp_pivot(transform.pivot_y) * sh
     ax, ay = _anchor_point(transform, canvas_w, canvas_h)
     angle = _normalized_rotation_deg(transform.rotation_deg)
-    rad = math.radians(-angle) if angle >= 0.001 and angle <= 359.999 else 0.0
+    rad = math.radians(-angle) if abs(angle) >= 0.001 else 0.0
 
     def to_canvas(lx: float, ly: float) -> tuple[float, float]:
         if rad:
@@ -257,6 +261,96 @@ def bake_subject_crop_pixels(layer: Layer, resolver: ImageResolver) -> Image.Ima
     if raw is None or not layer.crop:
         return None
     return _apply_crop(raw, layer.crop)
+
+
+def alpha_tight_bbox(im: Image.Image, *, threshold: int = 1) -> tuple[int, int, int, int] | None:
+    """非透明像素 tight bbox：(left, top, right, bottom)。"""
+    rgba = im.convert("RGBA")
+    if threshold <= 1:
+        return rgba.getbbox()
+    alpha = rgba.getchannel("A")
+    mask = alpha.point(lambda a: 255 if a >= threshold else 0, mode="L")
+    return mask.getbbox()
+
+
+def trim_layer_alpha_pixels(
+    layer: Layer,
+    resolver: ImageResolver,
+    *,
+    alpha_threshold: int = 1,
+) -> tuple[Image.Image | None, dict[str, int]]:
+    """按透明边裁切图层 raster（已应用 layer.crop）。无变化时返回 (None, {})。"""
+    raw = resolver.resolve(layer_image_source(layer))
+    if raw is None:
+        return None, {}
+    im = _apply_crop(raw, layer.crop).convert("RGBA")
+    bbox = alpha_tight_bbox(im, threshold=max(1, min(255, int(alpha_threshold))))
+    if not bbox:
+        return None, {"empty": 1}
+    x0, y0, x1, y1 = bbox
+    tw, th = x1 - x0, y1 - y0
+    if x0 == 0 and y0 == 0 and tw == im.width and th == im.height:
+        return None, {}
+    trimmed = im.crop(bbox)
+    return trimmed, {
+        "trim_x": x0,
+        "trim_y": y0,
+        "width": tw,
+        "height": th,
+        "old_width": im.width,
+        "old_height": im.height,
+    }
+
+
+def stack_content_bbox(
+    stack: LayerStack,
+    resolver: ImageResolver,
+    *,
+    alpha_threshold: int = 1,
+) -> tuple[int, int, int, int] | None:
+    """合成栈后按非透明像素取 tight bbox。"""
+    rendered = render_stack(stack, resolver)
+    return alpha_tight_bbox(rendered, threshold=max(1, min(255, int(alpha_threshold))))
+
+
+def shrink_stack_canvas_to_content(
+    stack: LayerStack,
+    resolver: ImageResolver,
+    *,
+    alpha_threshold: int = 1,
+) -> dict[str, Any]:
+    """将画布裁至全部可见图层内容 tight bbox，并平移图层 offset。"""
+    cw, ch = int(stack.canvas_width), int(stack.canvas_height)
+    bbox = stack_content_bbox(stack, resolver, alpha_threshold=alpha_threshold)
+    if not bbox:
+        return {"changed": False}
+    x0, y0, x1, y1 = bbox
+    nw, nh = x1 - x0, y1 - y0
+    if nw < 1 or nh < 1:
+        return {"changed": False}
+    if x0 == 0 and y0 == 0 and nw == cw and nh == ch:
+        return {"changed": False}
+
+    for layer in stack.layers:
+        xf = layer.transform
+        if xf.anchor == "top_left":
+            xf.offset_x = float(xf.offset_x) - x0
+            xf.offset_y = float(xf.offset_y) - y0
+        else:
+            xf.offset_x = float(xf.offset_x) + (cw / 2.0 - nw / 2.0) - x0
+            xf.offset_y = float(xf.offset_y) + (ch / 2.0 - nh / 2.0) - y0
+
+    stack.canvas_width = nw
+    stack.canvas_height = nh
+    return {
+        "changed": True,
+        "old_canvas_width": cw,
+        "old_canvas_height": ch,
+        "canvas_width": nw,
+        "canvas_height": nh,
+        "crop_x": x0,
+        "crop_y": y0,
+    }
 
 
 def _prepare_image_layer(
@@ -445,14 +539,31 @@ def render_stack(
         if not layer.visible:
             continue
         opacity = max(0.0, min(1.0, layer.opacity))
+        blend_mode = normalize_blend_mode(getattr(layer, "blend_mode", "normal"))
+        blend_color = str(getattr(layer, "blend_color", "") or "").strip()
+        blend_amount = max(0.0, min(1.0, float(getattr(layer, "blend_amount", 1.0))))
+        blend_enabled = bool(getattr(layer, "blend_enabled", False))
         if layer.type == "image":
             frame = _prepare_image_layer(layer, resolver, cw, ch)
             if frame.image is None or frame.bounds is None:
                 continue
             im = frame.image
-            if opacity < 0.999:
-                im = _apply_opacity(im, opacity)
-            canvas.alpha_composite(im, (frame.bounds.x, frame.bounds.y))
+            effective_mode = blend_mode if blend_enabled else "normal"
+            if blend_enabled and blend_color:
+                im = apply_layer_tint(
+                    im,
+                    color=blend_color,
+                    amount=blend_amount,
+                    mode=effective_mode,
+                )
+            composite_layer(
+                canvas,
+                im,
+                frame.bounds.x,
+                frame.bounds.y,
+                blend_mode=effective_mode if blend_enabled else "normal",
+                opacity=opacity,
+            )
         elif layer.type == "text" and layer.text and layer.text.content.strip():
             _draw_text_layer(canvas, layer, cw, ch, draw=draw, scratch=scratch, opacity=opacity)
     return canvas
@@ -501,11 +612,88 @@ def _draw_text_layer(
     )
 
 
-def render_stack_to_png_bytes(stack: LayerStack, resolver: ImageResolver) -> bytes:
-    im = render_stack(stack, resolver)
+def render_layers_subset(
+    stack: LayerStack,
+    resolver: ImageResolver,
+    layer_ids: set[str] | list[str],
+) -> Image.Image:
+    """将指定图层（按栈顺序）合成到透明画布，忽略 visible 状态。"""
+    id_set = set(layer_ids)
+    cw, ch = stack.canvas_width, stack.canvas_height
+    canvas = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
+    scratch = Image.new("RGBA", (max(cw, 4), max(ch, 4)), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(scratch)
+
+    for layer in stack.layers:
+        if layer.id not in id_set:
+            continue
+        opacity = max(0.0, min(1.0, layer.opacity))
+        blend_mode = normalize_blend_mode(getattr(layer, "blend_mode", "normal"))
+        blend_color = str(getattr(layer, "blend_color", "") or "").strip()
+        blend_amount = max(0.0, min(1.0, float(getattr(layer, "blend_amount", 1.0))))
+        blend_enabled = bool(getattr(layer, "blend_enabled", False))
+        if layer.type == "image":
+            frame = _prepare_image_layer(layer, resolver, cw, ch)
+            if frame.image is None or frame.bounds is None:
+                continue
+            im = frame.image
+            effective_mode = blend_mode if blend_enabled else "normal"
+            if blend_enabled and blend_color:
+                im = apply_layer_tint(
+                    im,
+                    color=blend_color,
+                    amount=blend_amount,
+                    mode=effective_mode,
+                )
+            composite_layer(
+                canvas,
+                im,
+                frame.bounds.x,
+                frame.bounds.y,
+                blend_mode=effective_mode if blend_enabled else "normal",
+                opacity=opacity,
+            )
+        elif layer.type == "text" and layer.text and layer.text.content.strip():
+            _draw_text_layer(canvas, layer, cw, ch, draw=draw, scratch=scratch, opacity=opacity)
+    return canvas
+
+
+def render_stack_to_png_bytes(
+    stack: LayerStack,
+    resolver: ImageResolver,
+    *,
+    solo_layer_id: str | None = None,
+) -> bytes:
+    im = render_stack(stack, resolver, solo_layer_id=solo_layer_id)
     buf = io.BytesIO()
     im.save(buf, format="PNG", optimize=True)
     return buf.getvalue()
+
+
+def render_layer_export_png_bytes(
+    stack: LayerStack,
+    resolver: ImageResolver,
+    layer_id: str,
+    *,
+    tight: bool = True,
+) -> tuple[bytes, dict[str, int]]:
+    """单图层导出 PNG；tight 时裁至非透明像素 tight bbox，并返回画布偏移。"""
+    im = render_stack(stack, resolver, solo_layer_id=layer_id)
+    offset_x = 0
+    offset_y = 0
+    if tight:
+        bbox = im.getbbox()
+        if bbox:
+            offset_x, offset_y = int(bbox[0]), int(bbox[1])
+            im = im.crop(bbox)
+    buf = io.BytesIO()
+    im.save(buf, format="PNG", optimize=True)
+    return buf.getvalue(), {
+        "offset_x": offset_x,
+        "offset_y": offset_y,
+        "width": im.width,
+        "height": im.height,
+    }
 
 
 def stack_checkerboard(width: int, height: int, *, cell: int = 8) -> Image.Image:

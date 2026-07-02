@@ -8,7 +8,12 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from alpha_matte import border_matte_to_alpha, seed_matte_to_alpha, stroke_matte_to_alpha
+from alpha_matte import (
+    border_matte_to_alpha,
+    polish_matte_alpha,
+    seed_matte_to_alpha,
+    stroke_matte_to_alpha,
+)
 from postprocess.models import ASSET_SUBJECT_SOURCE, Layer, layer_image_source
 
 
@@ -83,7 +88,7 @@ def sync_inbox_if_source_newer(asset_source: Path | None, inbox: Path) -> bool:
     if not inbox.is_file():
         return sync_asset_source_to_inbox(asset_source, inbox)
     try:
-        if asset_source.stat().st_mtime < inbox.stat().st_mtime:
+        if asset_source.stat().st_mtime <= inbox.stat().st_mtime:
             return False
     except OSError:
         return False
@@ -130,18 +135,23 @@ def apply_layer_matte(
     color_tol: float = 34.0,
     step_tol: float = 16.0,
     feather: int = 0,
+    brush_size: int = 1,
+    finalize: bool = True,
 ) -> dict[str, Any]:
     from PIL import Image
 
     with Image.open(path) as im:
         im.load()
         rgba = im.convert("RGBA")
+    refine_feather = max(0, int(feather))
+    if refine_feather == 0:
+        refine_feather = 1
     if mode == "border":
         out = border_matte_to_alpha(
             rgba,
             color_tol=color_tol,
             step_tol=step_tol,
-            feather=max(0, int(feather)),
+            feather=refine_feather,
         )
     elif mode == "seed":
         if seed_x is None or seed_y is None:
@@ -152,21 +162,34 @@ def apply_layer_matte(
             int(seed_y),
             color_tol=color_tol,
             step_tol=step_tol,
+            feather=refine_feather,
         )
     elif mode == "stroke":
-        if not seed_points:
-            raise ValueError("stroke 模式需要 seed_points")
-        out = stroke_matte_to_alpha(
-            rgba,
-            [(int(x), int(y)) for x, y in seed_points],
-            color_tol=color_tol,
-            step_tol=step_tol,
-        )
+        pts = [(int(x), int(y)) for x, y in (seed_points or [])]
+        out = rgba
+        if pts:
+            out = stroke_matte_to_alpha(
+                rgba,
+                pts,
+                color_tol=color_tol,
+                step_tol=step_tol,
+                brush_size=brush_size,
+                feather=refine_feather,
+                cleanup=False,
+            )
+        if finalize:
+            out = polish_matte_alpha(
+                out,
+                color_tol=color_tol,
+                feather=refine_feather,
+            )
+        elif not pts:
+            return {"width": out.width, "height": out.height, "path": str(path)}
     else:
         raise ValueError(f"未知抠图模式: {mode}")
 
     buf = io.BytesIO()
-    out.save(buf, format="PNG", optimize=True)
+    out.save(buf, format="PNG", optimize=finalize)
     path.write_bytes(buf.getvalue())
     return {"width": out.width, "height": out.height, "path": str(path)}
 

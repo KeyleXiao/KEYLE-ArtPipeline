@@ -41,7 +41,7 @@
       "lora_strength": 0.0,
       "positive_common": "(transparent background:1.4), (alpha channel:1.25), isolated subject, clean cutout sticker, simple flat background, single color backdrop, no scenery, floating object",
       "negative_common": "(solid background:1.35), (opaque background:1.25), complex background, detailed background, white background, black background, grey background, gradient background, colored backdrop, scenery, environment, floor, ground, wall, room, studio backdrop, vignette, cast shadow on ground",
-      "alpha_matte": "border"
+      "alpha_matte": "none"
     },
     {
       "id": "items",
@@ -55,7 +55,7 @@
       "lora_strength": 0.0,
       "positive_common": "(transparent background:1.4), (alpha channel:1.25), isolated subject, clean cutout sticker, simple flat background, single color backdrop, no scenery, floating object",
       "negative_common": "(solid background:1.35), (opaque background:1.25), complex background, detailed background, white background, black background, grey background, gradient background, colored backdrop, scenery, environment, floor, ground, wall, room, studio backdrop, vignette, cast shadow on ground",
-      "alpha_matte": "border"
+      "alpha_matte": "none"
     },
     {
       "id": "skills",
@@ -69,7 +69,7 @@
       "lora_strength": 0.0,
       "positive_common": "(transparent background:1.4), (alpha channel:1.25), isolated subject, clean cutout sticker, simple flat background, single color backdrop, no scenery, floating object",
       "negative_common": "(solid background:1.35), (opaque background:1.25), complex background, detailed background, white background, black background, grey background, gradient background, colored backdrop, scenery, environment, floor, ground, wall, room, studio backdrop, vignette, cast shadow on ground",
-      "alpha_matte": "border"
+      "alpha_matte": "none"
     },
     {
       "id": "ui_status",
@@ -83,7 +83,7 @@
       "lora_strength": 0.0,
       "positive_common": "(transparent background:1.4), (alpha channel:1.25), isolated subject, clean cutout sticker, simple flat background, single color backdrop, no scenery, floating object",
       "negative_common": "(solid background:1.35), (opaque background:1.25), complex background, detailed background, white background, black background, grey background, gradient background, colored backdrop, scenery, environment, floor, ground, wall, room, studio backdrop, vignette, cast shadow on ground",
-      "alpha_matte": "border"
+      "alpha_matte": "none"
     },
     {
       "id": "ui_frames",
@@ -97,7 +97,7 @@
       "lora_strength": 0.0,
       "positive_common": "(transparent background:1.4), (alpha channel:1.25), isolated subject, clean cutout sticker, simple flat background, single color backdrop, no scenery, floating object",
       "negative_common": "(solid background:1.35), (opaque background:1.25), complex background, detailed background, white background, black background, grey background, gradient background, colored backdrop, scenery, environment, floor, ground, wall, room, studio backdrop, vignette, cast shadow on ground",
-      "alpha_matte": "border"
+      "alpha_matte": "none"
     },
     {
       "id": "ui_buttons",
@@ -111,7 +111,7 @@
       "lora_strength": 0.0,
       "positive_common": "(transparent background:1.4), (alpha channel:1.25), isolated subject, clean cutout sticker, simple flat background, single color backdrop, no scenery, floating object",
       "negative_common": "(solid background:1.35), (opaque background:1.25), complex background, detailed background, white background, black background, grey background, gradient background, colored backdrop, scenery, environment, floor, ground, wall, room, studio backdrop, vignette, cast shadow on ground",
-      "alpha_matte": "border"
+      "alpha_matte": "none"
     },
     {
       "id": "ui_combat",
@@ -125,7 +125,7 @@
       "lora_strength": 0.0,
       "positive_common": "(transparent background:1.4), (alpha channel:1.25), isolated subject, clean cutout sticker, simple flat background, single color backdrop, no scenery, floating object",
       "negative_common": "(solid background:1.35), (opaque background:1.25), complex background, detailed background, white background, black background, grey background, gradient background, colored backdrop, scenery, environment, floor, ground, wall, room, studio backdrop, vignette, cast shadow on ground",
-      "alpha_matte": "border"
+      "alpha_matte": "none"
     },
     {
       "id": "backgrounds",

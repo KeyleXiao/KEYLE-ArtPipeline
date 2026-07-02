@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import platform
+import plistlib
 import shutil
 import subprocess
 import sys
@@ -230,8 +231,29 @@ def _copytree_preserve_links(src: Path, dest: Path) -> None:
     shutil.copytree(src, dest, symlinks=True)
 
 
+def patch_macos_info_plist(app_path: Path) -> None:
+    """
+    写入 ATS，允许 WKWebView 加载本地 http://127.0.0.1。
+    未配置时 pywebview 窗口可能只有深色背景（黑屏），内容区未挂上 WebView。
+    """
+    plist_path = app_path / "Contents" / "Info.plist"
+    if not plist_path.is_file():
+        return
+    with plist_path.open("rb") as handle:
+        plist = plistlib.load(handle)
+    plist["NSAppTransportSecurity"] = {
+        "NSAllowsArbitraryLoads": True,
+        "NSAllowsLocalNetworking": True,
+    }
+    plist.setdefault("LSMinimumSystemVersion", "11.0")
+    plist.setdefault("NSHighResolutionCapable", True)
+    with plist_path.open("wb") as handle:
+        plistlib.dump(plist, handle)
+
+
 def verify_macos_app_bundle(app_path: Path) -> None:
     """打包后校验 .app 结构，避免 CI artifact 上传后用户拿到残缺包。"""
+    patch_macos_info_plist(app_path)
     exe = app_path / "Contents" / "MacOS" / APP_NAME
     if not exe.is_file():
         die(f"macOS .app missing executable: {exe}")
@@ -421,6 +443,11 @@ exec python3 run_app.py "$@"
   <key>CFBundleVersion</key><string>2.0.0</string>
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSAppTransportSecurity</key>
+  <dict>
+    <key>NSAllowsArbitraryLoads</key><true/>
+    <key>NSAllowsLocalNetworking</key><true/>
+  </dict>
 </dict>
 </plist>
 """,

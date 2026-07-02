@@ -9,6 +9,7 @@ from typing import Any, Literal
 
 LayerType = Literal["image", "text"]
 Anchor = Literal["center", "top_left"]
+BlendMode = Literal["normal", "multiply", "screen", "overlay", "soft_light", "add", "color"]
 
 ASSET_SUBJECT_SOURCE = "$asset"
 
@@ -132,6 +133,10 @@ class Layer:
     visible: bool = True
     locked: bool = False
     opacity: float = 1.0
+    blend_mode: str = "normal"
+    blend_color: str = ""
+    blend_amount: float = 1.0
+    blend_enabled: bool = False
     transform: LayerTransform = field(default_factory=LayerTransform)
     source: str = ""
     crop: CropRect | None = None
@@ -171,6 +176,10 @@ class Layer:
             visible=self.visible,
             locked=False,
             opacity=self.opacity,
+            blend_mode=self.blend_mode,
+            blend_color=self.blend_color,
+            blend_amount=self.blend_amount,
+            blend_enabled=self.blend_enabled,
             transform=LayerTransform.from_dict(self.transform.to_dict()),
             source=self.source,
             crop=CropRect.from_dict(self.crop.to_dict()) if self.crop else None,
@@ -217,6 +226,8 @@ def layer_image_source(layer: Layer) -> str:
 
 
 def layer_from_dict(raw: dict[str, Any]) -> Layer:
+    from postprocess.blend import normalize_blend_mode
+
     layer_type = raw.get("type", "image")
     if layer_type not in ("image", "text"):
         layer_type = "image"
@@ -225,6 +236,12 @@ def layer_from_dict(raw: dict[str, Any]) -> Layer:
     source = str(raw.get("source", "")).strip()
     if layer_type == "image" and is_subject and not source:
         source = ASSET_SUBJECT_SOURCE
+    blend_amount = _clamp01(raw.get("blend_amount", 1.0))
+    blend_enabled = bool(raw.get("blend_enabled", False))
+    if "blend_enabled" not in raw:
+        blend_enabled = bool(str(raw.get("blend_color", "") or "").strip()) or (
+            normalize_blend_mode(raw.get("blend_mode")) != "normal"
+        )
     return Layer(
         id=str(raw.get("id") or _new_id()),
         name=str(raw.get("name", "图层")),
@@ -232,6 +249,10 @@ def layer_from_dict(raw: dict[str, Any]) -> Layer:
         visible=bool(raw.get("visible", True)),
         locked=bool(raw.get("locked", False)),
         opacity=float(raw.get("opacity", 1.0)),
+        blend_mode=normalize_blend_mode(raw.get("blend_mode")),
+        blend_color=str(raw.get("blend_color", "") or "").strip(),
+        blend_amount=blend_amount,
+        blend_enabled=blend_enabled,
         transform=LayerTransform.from_dict(raw.get("transform")),
         source=source,
         crop=CropRect.from_dict(raw.get("crop")),
@@ -248,6 +269,10 @@ def layer_to_dict(layer: Layer) -> dict[str, Any]:
         "visible": layer.visible,
         "locked": layer.locked,
         "opacity": layer.opacity,
+        "blend_mode": layer.blend_mode,
+        "blend_color": layer.blend_color,
+        "blend_amount": layer.blend_amount,
+        "blend_enabled": layer.blend_enabled,
         "transform": layer.transform.to_dict(),
     }
     if layer.type == "image":

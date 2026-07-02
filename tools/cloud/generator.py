@@ -59,20 +59,24 @@ LogFn = Callable[[str], None]
 
 
 def _cloud_prompt_for_asset(config: ConfigManager, asset: Asset) -> tuple[str, str]:
+    from bootstrap_config import merge_prompt_prefix, merge_prompt_suffix
+
+    merged = config.prompts_for_generation(asset)
     prompt = str(getattr(asset, "cloud_prompt", "") or "").strip()
     negative = str(getattr(asset, "cloud_negative", "") or "").strip()
-    if not prompt:
-        prompt = str(asset.positive or "").strip()
-        if not prompt:
-            parts = [
-                asset.positive_prefix,
-                asset.positive_subject,
-                asset.positive_scene,
-                asset.positive_light,
-            ]
-            prompt = ", ".join(p.strip().rstrip(",") for p in parts if p and str(p).strip())
-    if not negative:
-        negative = str(asset.negative or "").strip()
+    cat = config.category_by_id(asset.category)
+    pos_common = (cat.positive_common if cat else "").strip()
+    neg_common = (cat.negative_common if cat else "").strip()
+
+    if prompt:
+        prompt = merge_prompt_prefix(pos_common, prompt)
+    else:
+        prompt = merged["positive"]
+
+    if negative:
+        negative = merge_prompt_suffix(negative, neg_common)
+    else:
+        negative = merged["negative"]
     return prompt, negative
 
 

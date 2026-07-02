@@ -78,9 +78,23 @@ inbox/**/*.jpeg
 tools/workflows/assets/*
 !tools/workflows/assets/.gitkeep
 
+# 项目开发中的资源清单（本地测试分类，不入库）
+manifest/hud_v8.yaml
+
 .env
 .env.*
 """
+
+# manifest/ 中仅本地开发使用、不应进入公开仓库的文件
+MANIFEST_LOCAL_ONLY = (
+    "hud_v8.yaml",
+)
+
+# icons.yaml 中从此类行起视为「开发中分类」并裁剪（如 HudV8 测试图目录）
+ICONS_DEV_SECTION_MARKERS = (
+    re.compile(r"^#\s*HudV8\b", re.IGNORECASE),
+    re.compile(r"^hud_v8_", re.IGNORECASE),
+)
 
 RSYNC_EXCLUDES = [
     ".git",
@@ -93,6 +107,7 @@ RSYNC_EXCLUDES = [
     "inbox/",
     "workflows/assets/",  # tools/workflows/assets 个人工作流
     "pipeline_config.json",  # 本地主配置，不入库
+    *MANIFEST_LOCAL_ONLY,  # 开发中 manifest，不入库
 ]
 
 SANITIZE_DEFAULT_KEYS = (
@@ -193,6 +208,41 @@ def rsync_copy(src: Path, dest: Path, *, dry_run: bool) -> None:
     subprocess.run(cmd, check=True)
 
 
+def sanitize_manifest(dest: Path, *, dry_run: bool) -> None:
+    """移除项目开发中的 manifest（如 HudV8 测试图目录清单）。"""
+    manifest_dir = dest / "manifest"
+    if not manifest_dir.is_dir():
+        return
+
+    for name in MANIFEST_LOCAL_ONLY:
+        path = manifest_dir / name
+        if not path.exists():
+            continue
+        if dry_run:
+            print(f"  [dry-run] 删除本地清单 manifest/{name}")
+            continue
+        path.unlink()
+        print(f"  ✓ 已删除 manifest/{name}（项目开发清单，不入库）")
+
+    icons = manifest_dir / "icons.yaml"
+    if not icons.is_file():
+        return
+    lines = icons.read_text(encoding="utf-8").splitlines(keepends=True)
+    cut = len(lines)
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+        if any(pat.match(stripped) for pat in ICONS_DEV_SECTION_MARKERS):
+            cut = i
+            break
+    if cut >= len(lines):
+        return
+    if dry_run:
+        print(f"  [dry-run] 裁剪 manifest/icons.yaml（自第 {cut + 1} 行起为开发分类）")
+        return
+    icons.write_text("".join(lines[:cut]).rstrip() + "\n", encoding="utf-8")
+    print("  ✓ 已裁剪 manifest/icons.yaml（移除 HudV8 等开发中分类）")
+
+
 def sync_screenshots(dest: Path, *, dry_run: bool) -> None:
     """从 artAppSite 复制功能截图到 docs/images/ 与 artApp/web/docs/images/。"""
     src_dir = ARTAPP_SITE / "assets" / "screenshots"
@@ -256,6 +306,7 @@ def post_process(dest: Path, *, dry_run: bool) -> None:
     (dest / ".gitignore").write_text(GITHUB_GITIGNORE, encoding="utf-8")
     print("  ✓ 已写入 .gitignore")
 
+    sanitize_manifest(dest, dry_run=dry_run)
     sync_screenshots(dest, dry_run=dry_run)
 
 

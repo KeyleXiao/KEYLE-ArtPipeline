@@ -395,7 +395,7 @@ def _category(
         "lora_strength": lora_strength,
         "positive_common": CATEGORY_POSITIVE_COMMON if transparent else "",
         "negative_common": CATEGORY_NEGATIVE_COMMON if transparent else "",
-        "alpha_matte": "border" if transparent else "none",
+        "alpha_matte": "none",
     }
 
 

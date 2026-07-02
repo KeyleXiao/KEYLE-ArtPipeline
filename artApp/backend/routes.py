@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import json
 import platform
+import re
 import shutil
 import subprocess
 import time
@@ -20,9 +21,19 @@ from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from backend.deps import TOOLS_DIR, get_config_manager, reload_config_manager, sync_log_bus_from_config
+from backend.runtime_paths import user_data_dir
 from backend.services.log_bus import log_bus
 from backend.services.pipeline_runner import pipeline_runner
-from backend.services.preview import PREVIEW_MAX, PreviewSource, preview_png_bytes, resolve_path_for_source
+from backend.services.preview import (
+    PREVIEW_MAX,
+    PreviewSource,
+    invalidate_preview_cache,
+    preview_etag,
+    preview_png_bytes,
+    resolve_path_for_source,
+    resolve_preview_file,
+    should_remove_bg,
+)
 
 router = APIRouter(prefix="/api")
 
@@ -33,10 +44,8 @@ router = APIRouter(prefix="/api")
 def _asset_dict(a: Any, *, full: bool = False) -> dict[str, Any]:
     from cloud.registry import is_cloud_checkpoint
 
-    effective_ckpt = ""
-    if full:
-        config = get_config_manager()
-        effective_ckpt = config.checkpoint_for_asset(a)
+    config = get_config_manager()
+    effective_ckpt = config.checkpoint_for_asset(a)
     d = {
         "id": a.id,
         "filename": a.filename,
@@ -56,14 +65,13 @@ def _asset_dict(a: Any, *, full: bool = False) -> dict[str, Any]:
         "cloud_prompt": getattr(a, "cloud_prompt", ""),
         "cloud_negative": getattr(a, "cloud_negative", ""),
         "cloud_strength": getattr(a, "cloud_strength", 0.65),
+        "checkpoint": getattr(a, "checkpoint", "") or "",
+        "checkpoint_effective": effective_ckpt,
+        "is_cloud_model": is_cloud_checkpoint(effective_ckpt),
     }
     if full:
-        config = get_config_manager()
         src, _inbox, _unity = config.resolve_paths(a)
         d["source_path"] = str(src)
-        d["checkpoint"] = getattr(a, "checkpoint", "") or ""
-        d["checkpoint_effective"] = effective_ckpt or config.checkpoint_for_asset(a)
-        d["is_cloud_model"] = is_cloud_checkpoint(d["checkpoint_effective"])
         d["category_checkpoint"] = config.checkpoint_for_category(a.category)
         d["positive"] = a.positive
         d["negative"] = a.negative
@@ -91,6 +99,11 @@ def _category_dict(c: Any, *, full: bool = False) -> dict[str, Any]:
         "positive_common": c.positive_common if full else "",
         "negative_common": c.negative_common if full else "",
     }
+    if full:
+        config = get_config_manager()
+        d["source"] = str(config.category_source_path(c))
+        d["inbox"] = str(config.category_inbox_path(c))
+        d["unity"] = str(config.category_unity_path(c))
     return d
 
 
@@ -187,6 +200,8 @@ class LayerMatteBody(BaseModel):
     color_tol: float = 34.0
     step_tol: float = 16.0
     feather: int = 0
+    brush_size: int = Field(default=1, ge=1, le=50)
+    finalize: bool = True
 
 
 class LayerRawBody(BaseModel):
@@ -200,6 +215,13 @@ class LayerRestoreImageBody(BaseModel):
     image_b64: str
     stack: dict[str, Any] | None = None
     subject_path: str | None = None
+
+
+class LayerTrimAlphaBody(BaseModel):
+    layer_id: str
+    stack: dict[str, Any] | None = None
+    subject_path: str | None = None
+    alpha_threshold: int = 1
 
 
 class PostprocessPrepareBody(BaseModel):
@@ -264,6 +286,44 @@ class PickImageFileBody(BaseModel):
     initial_dir: str | None = None
 
 
+class PickSavePngBody(BaseModel):
+    initial_dir: str | None = None
+    default_name: str = "export.png"
+    title: str | None = None
+
+
+class PickOutputDirBody(BaseModel):
+    initial_dir: str | None = None
+    title: str | None = None
+    relative_base: str | None = "art"  # art | project | none
+
+
+class ValidatePathBody(BaseModel):
+    path: str = ""
+    kind: str = "dir"  # dir | file | any
+    base: str = "absolute"  # absolute | art | project
+    optional: bool = False
+
+
+def _resolve_user_path(config: Any, raw: str, base: str) -> Path:
+    s = (raw or "").strip()
+    if not s:
+        return Path()
+    if "\0" in s:
+        raise ValueError("路径包含非法字符")
+    p = Path(s).expanduser()
+    if not p.is_absolute() and (s.startswith("Users/") or s.startswith("Volumes/")):
+        p = Path("/") / s
+        p = p.expanduser()
+    if p.is_absolute():
+        return p.resolve()
+    if base == "art":
+        return (config.art_root() / s).resolve()
+    if base == "project":
+        return (config.project_root() / s).resolve()
+    return p.resolve()
+
+
 def _rel_to_art_root(path: Path, art_root: Path) -> str:
     try:
         return path.resolve().relative_to(art_root.resolve()).as_posix()
@@ -310,6 +370,203 @@ end try
         return Path(path) if path else None
     except Exception:
         return None
+
+
+def _pick_save_png_path(initial_dir: Path, default_name: str, title: str = "保存 PNG") -> Path | None:
+    initial = str(initial_dir.resolve())
+    safe_name = Path(default_name).name or "export.png"
+    if platform.system() == "Darwin":
+        esc = initial.replace("\\", "\\\\").replace('"', '\\"')
+        name_esc = safe_name.replace('"', '\\"')
+        title_esc = title.replace('"', '\\"')
+        script = f'''
+set defaultPath to POSIX file "{esc}"
+try
+    set picked to choose file name with prompt "{title_esc}" default name "{name_esc}" default location defaultPath
+    return POSIX path of picked
+on error number -128
+    return ""
+end try
+'''
+        r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+        p = r.stdout.strip()
+        return Path(p) if p else None
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            root.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        path = filedialog.asksaveasfilename(
+            title=title,
+            initialdir=initial,
+            initialfile=safe_name,
+            defaultextension=".png",
+            filetypes=[("PNG", "*.png"), ("All", "*.*")],
+        )
+        root.destroy()
+        return Path(path) if path else None
+    except Exception:
+        return None
+
+
+def _pick_output_dir(initial_dir: Path, title: str = "选择文件夹") -> Path | None:
+    initial = str(initial_dir.resolve())
+    if platform.system() == "Darwin":
+        esc = initial.replace("\\", "\\\\").replace('"', '\\"')
+        title_esc = title.replace('"', '\\"')
+        script = f'''
+set defaultPath to POSIX file "{esc}"
+try
+    set picked to choose folder with prompt "{title_esc}" default location defaultPath
+    return POSIX path of picked
+on error number -128
+    return ""
+end try
+'''
+        r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+        p = r.stdout.strip()
+        return Path(p) if p else None
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            root.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        path = filedialog.askdirectory(title=title, initialdir=initial, mustexist=True)
+        root.destroy()
+        return Path(path) if path else None
+    except Exception:
+        return None
+
+
+def _safe_export_stem(name: str, layer_id: str) -> str:
+    stem = re.sub(r"[^\w\-\u4e00-\u9fff]+", "_", (name or layer_id).strip())
+    stem = stem.strip("_") or layer_id
+    return stem[:64]
+
+
+def _inbox_multi_layer_dir(inbox: Path, asset: Any, asset_id: str) -> Path:
+    stem = Path(asset.filename or asset_id).stem
+    return inbox.parent / stem
+
+
+def _export_stack_layers_to_dir(
+    stack: Any,
+    resolver: Any,
+    output_dir: Path,
+    *,
+    asset_id: str = "",
+    asset_filename: str = "",
+    tight: bool = True,
+    include_hidden: bool = False,
+) -> dict[str, Any]:
+    """将 stack 各可见图层导出为单独 PNG，并写入 manifest.json。"""
+    from postprocess.engine import render_layer_export_png_bytes
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    exported: list[dict[str, Any]] = []
+    used_names: dict[str, int] = {}
+    for layer in stack.layers:
+        if not include_hidden and layer.visible is False:
+            continue
+        try:
+            data, meta = render_layer_export_png_bytes(
+                stack,
+                resolver,
+                layer.id,
+                tight=bool(tight),
+            )
+        except Exception as exc:
+            log_bus.log(f"图层导出跳过 {layer.name}: {exc}", kind="系统")
+            continue
+        if not data or meta.get("width", 0) <= 0 or meta.get("height", 0) <= 0:
+            continue
+        base = _safe_export_stem(layer.name or "", layer.id)
+        count = used_names.get(base, 0)
+        used_names[base] = count + 1
+        fname = f"{base}.png" if count == 0 else f"{base}_{count + 1}.png"
+        out_path = output_dir / fname
+        _write_bytes_atomic(out_path, data)
+        exported.append(
+            {
+                "id": layer.id,
+                "name": layer.name,
+                "type": layer.type,
+                "file": fname,
+                "path": str(out_path.resolve()),
+                "offset_x": meta["offset_x"],
+                "offset_y": meta["offset_y"],
+                "width": meta["width"],
+                "height": meta["height"],
+            }
+        )
+
+    if not exported:
+        raise ValueError("没有可导出的可见图层")
+
+    manifest = {
+        "asset_id": asset_id,
+        "filename": asset_filename,
+        "canvas_width": stack.canvas_width,
+        "canvas_height": stack.canvas_height,
+        "tight_crop": bool(tight),
+        "layers": exported,
+    }
+    manifest_path = output_dir / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return {
+        "count": len(exported),
+        "layers": exported,
+        "manifest": str(manifest_path.resolve()),
+        "dir": str(output_dir.resolve()),
+    }
+
+
+def _default_export_dir(config: Any, asset: Any) -> Path:
+    art_root = config.art_root()
+    stem = Path(asset.filename or asset.id).stem
+    return art_root / "postprocess" / "exports" / stem
+
+
+def _resolve_pick_initial_dir(config: Any, body_initial: str | None) -> Path:
+    art_root = config.art_root()
+    project_root = config.project_root()
+    initial = art_root
+    raw = (body_initial or "").strip()
+    if not raw:
+        return initial
+
+    cand = Path(raw).expanduser()
+    if cand.is_absolute():
+        if cand.is_dir():
+            return cand.resolve()
+        if cand.parent.is_dir():
+            return cand.parent.resolve()
+        return initial
+
+    for root in (art_root, project_root):
+        full = (root / raw).resolve()
+        if full.is_dir():
+            return full
+        if full.parent.is_dir():
+            return full.parent
+    if cand.is_dir():
+        return cand.resolve()
+    if cand.parent.is_dir():
+        return cand.parent.resolve()
+    return initial
 
 
 # ── Health / config ─────────────────────────────────────────────
@@ -706,11 +963,11 @@ def update_category(cat_id: str, body: CategoryUpdateBody) -> dict[str, str]:
     if body.label is not None:
         cat.label = body.label.strip()
     if body.source is not None:
-        cat.source = body.source.strip()
+        cat.source = config.normalize_category_path(body.source.strip(), under="art")
     if body.inbox is not None:
-        cat.inbox = body.inbox.strip()
+        cat.inbox = config.normalize_category_path(body.inbox.strip(), under="art")
     if body.unity is not None:
-        cat.unity = body.unity.strip()
+        cat.unity = config.normalize_category_path(body.unity.strip(), under="project")
     if body.checkpoint is not None:
         cat.checkpoint = body.checkpoint.strip()
     if body.positive_common is not None:
@@ -1211,12 +1468,18 @@ def asset_preview(
     if not asset:
         raise HTTPException(404, f"资源不存在: {asset_id}")
     try:
+        path = resolve_preview_file(config, asset, source)
+        remove_bg = should_remove_bg(config, asset)
+        etag = preview_etag(path, max, remove_bg)
         data = preview_png_bytes(config, asset, source=source, max_size=max)
     except FileNotFoundError as exc:
         raise HTTPException(404, str(exc)) from exc
     except Exception as exc:
         raise HTTPException(500, str(exc)) from exc
-    return Response(content=data, media_type="image/png")
+    headers = {"Cache-Control": "private, max-age=86400"}
+    if etag:
+        headers["ETag"] = etag
+    return Response(content=data, media_type="image/png", headers=headers)
 
 
 @router.get("/assets/{asset_id}/paths")
@@ -1364,6 +1627,8 @@ def _pp_resolver(config: Any, asset: Any, subject: str | None = None) -> Any:
 
 def _sync_inbox_before_apply(config: Any, asset: Any, body: dict[str, Any]) -> None:
     """apply / preview 前：source 有更新时同步到 inbox，或按请求强制同步。"""
+    if body.get("skip_inbox_sync"):
+        return
     from postprocess.matte import (
         is_subject_master_edit_mode,
         sync_asset_source_to_inbox,
@@ -1388,7 +1653,10 @@ def _sync_inbox_before_apply(config: Any, asset: Any, body: dict[str, Any]) -> N
 
 def _after_layer_image_write(config: Any, asset: Any, path: Path | None) -> None:
     """图层 PNG 写入后：若改了本资源 source 原图，同步到 inbox。"""
+    from backend.services.postprocess_preview import invalidate_postprocess_preview_cache
     from postprocess.matte import is_asset_source_path, sync_asset_source_to_inbox
+
+    invalidate_postprocess_preview_cache()
 
     if path is None:
         return
@@ -1468,6 +1736,20 @@ def _reset_subject_layer_after_master_write(stack: Any) -> None:
         scale=1.0,
         anchor=anchor,
     )
+
+
+def _reset_subject_layer_transform_to_default(subj: Any) -> None:
+    """主体层恢复默认变换（画布已与 PNG 像素 1:1 对齐时使用）。"""
+    from postprocess.models import LayerTransform
+
+    anchor = subj.transform.anchor if subj.transform else "center"
+    subj.crop = None
+    subj.transform = LayerTransform(anchor=anchor)
+
+
+def _is_single_subject_stack(stack: Any) -> bool:
+    layers = stack.layers or []
+    return len(layers) == 1 and layers[0].type == "image" and bool(layers[0].is_subject)
 
 
 def _write_canvas_render_to_source(
@@ -1653,8 +1935,81 @@ def _resolve_postprocess_stack(
     return stack
 
 
+def _subject_layer_has_default_layout(layer: Any) -> bool:
+    xf = layer.transform
+    crop = layer.crop
+    return (
+        abs(float(xf.scale) - 1.0) < 1e-6
+        and abs(float(xf.offset_x)) < 1e-6
+        and abs(float(xf.offset_y)) < 1e-6
+        and abs(float(xf.rotation_deg)) < 1e-6
+        and not xf.flip_h
+        and not xf.flip_v
+        and crop is None
+    )
+
+
+def _sync_stack_canvas_to_subject_image(
+    config: Any,
+    asset: Any,
+    stack: Any,
+    subject_path: str | None,
+    *,
+    persist: bool = False,
+) -> tuple[bool, int, int]:
+    """将画布对齐到正在编辑的主体 PNG 尺寸；单主体层时清除迁就旧画布的缩放/偏移。"""
+    from PIL import Image
+
+    from postprocess.matte import normalize_edit_subject, resolve_layer_image_path
+
+    subj = stack.subject_layer()
+    if not subj or subj.type != "image":
+        return False, int(stack.canvas_width), int(stack.canvas_height)
+
+    inbox = _ensure_inbox_for_postprocess(config, asset)
+    subject_key = normalize_edit_subject(subject_path)
+    path = resolve_layer_image_path(
+        **_pp_layer_write_kwargs(config, asset, inbox, subject_key),
+        layer=subj,
+    )
+    if not path or not path.is_file():
+        return False, int(stack.canvas_width), int(stack.canvas_height)
+
+    with Image.open(path) as im:
+        iw, ih = int(im.width), int(im.height)
+
+    crop = subj.crop
+    if crop and int(getattr(crop, "w", 0) or 0) > 0 and int(getattr(crop, "h", 0) or 0) > 0:
+        iw = int(crop.w)
+        ih = int(crop.h)
+
+    cw, ch = int(stack.canvas_width), int(stack.canvas_height)
+    single_subject = _is_single_subject_stack(stack)
+    default_layout = _subject_layer_has_default_layout(subj)
+
+    changed = False
+    if cw != iw or ch != ih:
+        stack.canvas_width = iw
+        stack.canvas_height = ih
+        changed = True
+
+    stack.edit_subject = subject_key
+    if single_subject and (changed or not default_layout):
+        _reset_subject_layer_transform_to_default(subj)
+        changed = True
+
+    if changed and persist:
+        config.set_postprocess_stack(asset.id, stack)
+    return changed, iw, ih
+
+
 @router.get("/assets/{asset_id}/postprocess")
-def get_postprocess(asset_id: str) -> dict[str, Any]:
+def get_postprocess(
+    asset_id: str,
+    subject: str = "inbox",
+    skip_canvas_sync: bool = False,
+) -> dict[str, Any]:
+    from postprocess.matte import normalize_edit_subject
     from postprocess.models import stack_to_dict
 
     config = get_config_manager()
@@ -1662,10 +2017,24 @@ def get_postprocess(asset_id: str) -> dict[str, Any]:
     if not asset:
         raise HTTPException(404, f"资源不存在: {asset_id}")
     _ensure_inbox_for_postprocess(config, asset)
+    subject_key = normalize_edit_subject(subject)
     stack = config.get_postprocess_stack(asset_id)
     if not stack:
         stack = config.default_postprocess_stack(asset)
-    return {"stack": stack_to_dict(stack)}
+    if skip_canvas_sync:
+        synced, img_w, img_h = False, int(stack.canvas_width), int(stack.canvas_height)
+    else:
+        synced, img_w, img_h = _sync_stack_canvas_to_subject_image(
+            config, asset, stack, subject_key, persist=True
+        )
+        if synced:
+            reload_config_manager()
+    return {
+        "stack": stack_to_dict(stack),
+        "image_size": {"width": img_w, "height": img_h},
+        "canvas_synced": synced,
+        "edit_subject": subject_key,
+    }
 
 
 @router.put("/assets/{asset_id}/postprocess")
@@ -1719,10 +2088,21 @@ def prepare_postprocess(asset_id: str, body: PostprocessPrepareBody) -> dict[str
         if not unity.is_file():
             raise HTTPException(400, f"游戏引擎导出文件不存在: {asset.filename}")
 
+    stack = config.get_postprocess_stack(asset_id)
+    if not stack:
+        stack = config.default_postprocess_stack(asset)
+    synced, img_w, img_h = _sync_stack_canvas_to_subject_image(
+        config, asset, stack, subject, persist=True
+    )
+    if synced:
+        reload_config_manager()
+
     return {
         "status": "ok",
         "subject_path": subject,
         "inbox_initialized": inbox_initialized,
+        "canvas_synced": synced,
+        "image_size": {"width": img_w, "height": img_h},
         "paths": {
             "source": str(src) if src else "",
             "inbox": str(inbox) if inbox else "",
@@ -1734,15 +2114,16 @@ def prepare_postprocess(asset_id: str, body: PostprocessPrepareBody) -> dict[str
 @router.post("/assets/{asset_id}/postprocess/preview")
 def postprocess_preview(asset_id: str, body: dict[str, Any]) -> Response:
     """编辑器实时预览（不写入配置）。"""
-    import io
-
-    from postprocess.engine import render_stack, stack_checkerboard
+    from backend.services.postprocess_preview import (
+        cached_postprocess_preview_png,
+        postprocess_preview_cache_key,
+    )
 
     config = get_config_manager()
     asset = config.asset_by_id(asset_id)
     if not asset:
         raise HTTPException(404, f"资源不存在: {asset_id}")
-    _ensure_inbox_for_postprocess(config, asset)
+    inbox = _ensure_inbox_for_postprocess(config, asset)
     _sync_inbox_before_render(config, asset, body)
     stack = _resolve_postprocess_stack(config, asset, body.get("stack"))
     if not stack:
@@ -1750,12 +2131,18 @@ def postprocess_preview(asset_id: str, body: dict[str, Any]) -> Response:
     resolver = _pp_resolver(config, asset, body.get("subject_path"))
     solo = body.get("solo_layer_id") or None
     try:
-        doc = render_stack(stack, resolver, solo_layer_id=solo)
-        bg = stack_checkerboard(stack.canvas_width, stack.canvas_height)
-        bg.alpha_composite(doc)
-        buf = io.BytesIO()
-        bg.save(buf, format="PNG", optimize=True)
-        data = buf.getvalue()
+        src, _inbox, unity = config.resolve_paths(asset)
+        cache_key = postprocess_preview_cache_key(
+            asset_id,
+            stack,
+            body,
+            config=config,
+            asset=asset,
+            inbox=inbox,
+            asset_source=src if src.is_file() else None,
+            asset_unity=unity if unity.is_file() else None,
+        )
+        data = cached_postprocess_preview_png(cache_key, stack, resolver, solo_layer_id=solo)
     except Exception as exc:
         raise HTTPException(500, str(exc)) from exc
     return Response(content=data, media_type="image/png")
@@ -1845,8 +2232,8 @@ def postprocess_layer_matte(asset_id: str, body: LayerMatteBody) -> dict[str, An
         raise HTTPException(400, "mode 须为 border、seed 或 stroke")
     if mode == "seed" and (body.seed_x is None or body.seed_y is None):
         raise HTTPException(400, "seed 模式需要 seed_x / seed_y")
-    if mode == "stroke" and not body.seed_points:
-        raise HTTPException(400, "stroke 模式需要 seed_points")
+    if mode == "stroke" and not body.seed_points and not body.finalize:
+        raise HTTPException(400, "stroke 模式需要 seed_points 或 finalize")
 
     seed_points: list[tuple[int, int]] | None = None
     if mode == "stroke" and body.seed_points:
@@ -1866,6 +2253,8 @@ def postprocess_layer_matte(asset_id: str, body: LayerMatteBody) -> dict[str, An
             color_tol=float(body.color_tol),
             step_tol=float(body.step_tol),
             feather=int(body.feather),
+            brush_size=int(body.brush_size),
+            finalize=bool(body.finalize),
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -1918,12 +2307,19 @@ def _postprocess_layer_raw_image(
         layer=layer,
     )
     if not path or not path.is_file():
+        log_bus.log(f"layer-raw 图片不存在: {asset.filename} layer={layer_id}", kind="系统")
         raise HTTPException(404, "图层图片不存在")
+    if path.suffix.lower() == ".png":
+        try:
+            data = path.read_bytes()
+            if len(data) >= 8:
+                return data, layer
+        except OSError:
+            pass
     with Image.open(path) as im:
-        im.load()
         rgba = im.convert("RGBA")
     buf = io.BytesIO()
-    rgba.save(buf, format="PNG", optimize=True)
+    rgba.save(buf, format="PNG", optimize=False, compress_level=1)
     return buf.getvalue(), layer
 
 
@@ -1988,7 +2384,34 @@ def layer_restore_image(asset_id: str, body: LayerRestoreImageBody) -> dict[str,
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
     _after_layer_image_write(config, asset, path)
+    layer.crop = None
+    config.set_postprocess_stack(asset_id, stack)
+    reload_config_manager()
     return {"status": "ok", "path": str(path)}
+
+
+@router.post("/assets/{asset_id}/postprocess/trim-layer-alpha")
+def trim_layer_alpha(asset_id: str, body: LayerTrimAlphaBody) -> dict[str, Any]:
+    """自适应裁切：去除图层 PNG 透明边距并写回，调整 offset 保持画布位置。"""
+    config = get_config_manager()
+    asset = config.asset_by_id(asset_id)
+    if not asset:
+        raise HTTPException(404, f"资源不存在: {asset_id}")
+    _ensure_inbox_for_postprocess(config, asset)
+    stack = _resolve_postprocess_stack(config, asset, body.stack)
+    if not stack:
+        raise HTTPException(400, "无效 stack")
+    layer = next((l for l in stack.layers if l.id == body.layer_id), None)
+    if not layer or layer.type != "image":
+        raise HTTPException(404, f"图层不存在或非图片: {body.layer_id}")
+    return _apply_auto_trim_stack(
+        config,
+        asset,
+        stack,
+        layer,
+        alpha_threshold=body.alpha_threshold,
+        subject_path=body.subject_path,
+    )
 
 
 @router.post("/assets/{asset_id}/postprocess/restore-from-source")
@@ -2010,6 +2433,187 @@ def restore_postprocess_from_source(asset_id: str) -> dict[str, Any]:
     reload_config_manager()
     log_bus.log(f"已从 source 还原 inbox 并重置后处理: {asset.filename}", kind="操作")
     return {"path": str(inbox), "stack": stack_to_dict(stack)}
+
+
+@router.post("/assets/{asset_id}/remove-magenta")
+def remove_magenta_from_asset(asset_id: str) -> dict[str, Any]:
+    """对 inbox 应用品红色键去底（HudV8 快捷操作），并重置后处理图层栈。"""
+    import io
+
+    import numpy as np
+    from alpha_matte import magenta_key_to_alpha
+    from PIL import Image
+    from postprocess.models import stack_to_dict
+
+    config = get_config_manager()
+    asset = config.asset_by_id(asset_id)
+    if not asset:
+        raise HTTPException(404, f"资源不存在: {asset_id}")
+    inbox = _ensure_inbox_for_postprocess(config, asset)
+    with Image.open(inbox) as im:
+        im.load()
+        before = im.convert("RGBA")
+        alpha_before = np.array(before)[:, :, 3]
+        out = magenta_key_to_alpha(before, fuzz=34.0, feather=2)
+        alpha_after = np.array(out)[:, :, 3]
+
+    if not np.any(alpha_before != alpha_after):
+        return {"changed": False, "path": str(inbox)}
+
+    buf = io.BytesIO()
+    out.save(buf, format="PNG", optimize=True)
+    _write_bytes_atomic(inbox, buf.getvalue())
+    invalidate_preview_cache()
+    from backend.services.postprocess_preview import invalidate_postprocess_preview_cache
+
+    invalidate_postprocess_preview_cache()
+
+    stack = config.default_postprocess_stack(asset)
+    config.set_postprocess_stack(asset_id, stack)
+    reload_config_manager()
+    log_bus.log(f"去除洋红: {asset.filename}", kind="操作")
+    return {
+        "changed": True,
+        "path": str(inbox),
+        "stack": stack_to_dict(stack),
+    }
+
+
+def _subject_image_layer(stack: Any) -> Any | None:
+    for layer in stack.layers:
+        if layer.type == "image" and (layer.is_subject or layer.source == "$asset"):
+            return layer
+    for layer in stack.layers:
+        if layer.type == "image":
+            return layer
+    return None
+
+
+def _apply_auto_trim_stack(
+    config: Any,
+    asset: Any,
+    stack: Any,
+    layer: Any,
+    *,
+    alpha_threshold: int = 1,
+    subject_path: str | None = None,
+) -> dict[str, Any]:
+    """自适应裁切：裁图层透明边并缩小画布。"""
+    import io
+
+    from PIL import Image
+
+    from postprocess.engine import layer_frame, shrink_stack_canvas_to_content, trim_layer_alpha_pixels
+    from postprocess.matte import resolve_layer_image_path
+    from postprocess.models import stack_to_dict
+
+    inbox = _ensure_inbox_for_postprocess(config, asset)
+    if layer.locked:
+        raise HTTPException(400, "图层已锁定")
+
+    resolver = _pp_resolver(config, asset, subject_path)
+    scratch = Image.new(
+        "RGBA",
+        (max(stack.canvas_width, 4), max(stack.canvas_height, 4)),
+        (0, 0, 0, 0),
+    )
+    frame_before = layer_frame(layer, stack, resolver, scratch=scratch)
+    pivot_before = frame_before.get("pivot") if frame_before else None
+
+    from postprocess.models import layer_image_source
+
+    raw_probe = resolver.resolve(layer_image_source(layer))
+    if raw_probe and layer.crop:
+        c = layer.crop.clamp_to(raw_probe.width, raw_probe.height)
+        if c.x == 0 and c.y == 0 and c.w == raw_probe.width and c.h == raw_probe.height:
+            layer.crop = None
+
+    trimmed, meta = trim_layer_alpha_pixels(
+        layer,
+        resolver,
+        alpha_threshold=alpha_threshold,
+    )
+    layer_trim_changed = False
+    if trimmed is None:
+        if meta.get("empty"):
+            raise HTTPException(400, "图层完全透明，无法裁切")
+    else:
+        path = resolve_layer_image_path(
+            **_pp_layer_write_kwargs(config, asset, inbox, subject_path),
+            layer=layer,
+        )
+        if not path:
+            raise HTTPException(404, "图层图片不存在")
+
+        buf = io.BytesIO()
+        trimmed.save(buf, format="PNG", optimize=True)
+        _write_bytes_atomic(path, buf.getvalue())
+        _after_layer_image_write(config, asset, path)
+        layer.crop = None
+        layer_trim_changed = True
+        resolver = _pp_resolver(config, asset, subject_path)
+        frame_after = layer_frame(layer, stack, resolver, scratch=scratch)
+        if pivot_before and frame_after and frame_after.get("pivot"):
+            layer.transform.offset_x += pivot_before["x"] - frame_after["pivot"]["x"]
+            layer.transform.offset_y += pivot_before["y"] - frame_after["pivot"]["y"]
+
+    canvas_meta = shrink_stack_canvas_to_content(
+        stack,
+        resolver,
+        alpha_threshold=alpha_threshold,
+    )
+
+    if not layer_trim_changed and not canvas_meta.get("changed"):
+        return {"status": "unchanged", "unchanged": True}
+
+    invalidate_preview_cache()
+    config.set_postprocess_stack(asset.id, stack)
+    reload_config_manager()
+    if layer_trim_changed and meta.get("old_width"):
+        log_msg = (
+            f"自适应裁切 {layer.name or layer.id}: {meta.get('old_width')}×{meta.get('old_height')} → "
+            f"{meta.get('width')}×{meta.get('height')} ({asset.filename})"
+        )
+    else:
+        log_msg = f"自适应裁切（缩画布） {layer.name or layer.id} ({asset.filename})"
+    if canvas_meta.get("changed"):
+        log_msg += (
+            f"；画布 {canvas_meta.get('old_canvas_width')}×{canvas_meta.get('old_canvas_height')}"
+            f" → {canvas_meta.get('canvas_width')}×{canvas_meta.get('canvas_height')}"
+        )
+    log_bus.log(log_msg, kind="操作")
+    result: dict[str, Any] = {
+        "status": "ok",
+        "width": meta.get("width"),
+        "height": meta.get("height"),
+        "old_width": meta.get("old_width"),
+        "old_height": meta.get("old_height"),
+        "canvas": canvas_meta,
+        "stack": stack_to_dict(stack),
+    }
+    if layer_trim_changed:
+        path = resolve_layer_image_path(
+            **_pp_layer_write_kwargs(config, asset, inbox, subject_path),
+            layer=layer,
+        )
+        if path:
+            result["path"] = str(path)
+    return result
+
+
+@router.post("/assets/{asset_id}/auto-trim-inbox")
+def auto_trim_inbox(asset_id: str) -> dict[str, Any]:
+    """主界面快捷：对 inbox 主体图层做自适应裁切（透明边 + 缩画布）。"""
+    config = get_config_manager()
+    asset = config.asset_by_id(asset_id)
+    if not asset:
+        raise HTTPException(404, f"资源不存在: {asset_id}")
+    _ensure_inbox_for_postprocess(config, asset)
+    stack = _resolve_postprocess_stack(config, asset, None)
+    layer = _subject_image_layer(stack)
+    if not layer:
+        raise HTTPException(400, "无图片图层可裁切")
+    return _apply_auto_trim_stack(config, asset, stack, layer)
 
 
 @router.get("/assets/{asset_id}/postprocess/subject-raw.png")
@@ -2124,20 +2728,42 @@ def apply_postprocess(
             composed_data = render_stack_to_png_bytes(stack, resolver)
     except Exception as exc:
         raise HTTPException(500, str(exc)) from exc
-    data = composed_data
-    if not data:
-        raise HTTPException(500, "合成结果为空")
-    inbox.parent.mkdir(parents=True, exist_ok=True)
-    tmp = inbox.with_name(f".{inbox.name}.apply.tmp")
-    try:
-        tmp.write_bytes(data)
-        tmp.replace(inbox)
-    finally:
-        if tmp.is_file():
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
+
+    edit_key = normalize_edit_subject(body.get("subject_path") or body.get("edit_subject"))
+    export_multi = bool(body.get("export_multi_layers")) and not body.get("export_unity")
+    export_multi = export_multi and edit_key == "inbox"
+    tight_crop = body.get("tight_crop", True) is not False
+
+    if export_multi:
+        layer_dir = _inbox_multi_layer_dir(inbox, asset, asset_id)
+        try:
+            export_info = _export_stack_layers_to_dir(
+                stack,
+                resolver,
+                layer_dir,
+                asset_id=asset_id,
+                asset_filename=asset.filename or "",
+                tight=tight_crop,
+                include_hidden=False,
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        data = composed_data
+    else:
+        if not composed_data:
+            raise HTTPException(500, "合成结果为空")
+        inbox.parent.mkdir(parents=True, exist_ok=True)
+        tmp = inbox.with_name(f".{inbox.name}.apply.tmp")
+        try:
+            tmp.write_bytes(composed_data)
+            tmp.replace(inbox)
+        finally:
+            if tmp.is_file():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+        data = composed_data
 
     if had_subject_crop and not canvas_written:
         _clear_subject_crop(stack)
@@ -2157,9 +2783,19 @@ def apply_postprocess(
         log_bus.log(f"后处理已写入 source 并同步 inbox: {asset.filename}", kind="操作")
     elif baked_master and mode == "unity":
         log_bus.log(f"后处理已写入游戏引擎文件并同步 inbox: {asset.filename}", kind="操作")
+    elif export_multi:
+        log_bus.log(
+            f"多图层导出至 inbox 子文件夹: {layer_dir.name}（{export_info['count']} 层）",
+            kind="操作",
+        )
     else:
         log_bus.log(f"后处理已写入 inbox: {asset.filename}", kind="操作")
-    result: dict[str, Any] = {"path": str(inbox), "bytes": len(data)}
+    result: dict[str, Any] = {"path": str(inbox), "bytes": len(data) if data else 0}
+    if export_multi:
+        result["path"] = str(layer_dir)
+        result["multi_layer_dir"] = str(layer_dir)
+        result["multi_layer_count"] = export_info["count"]
+        result["manifest"] = export_info["manifest"]
     if size_synced:
         result["width"] = int(asset.width)
         result["height"] = int(asset.height)
@@ -2183,6 +2819,263 @@ def apply_postprocess(
         result["unity_path"] = str(unity)
         log_bus.log(f"已导出 Unity: {asset.filename}", kind="操作")
     return result
+
+
+@router.post("/assets/{asset_id}/postprocess/smart-split")
+def smart_split_postprocess(asset_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    """智能拆分：按 alpha 连通域将主体图集拆为多个图层。"""
+    from postprocess.models import stack_to_dict
+    from postprocess.split import smart_split_subject_layer
+
+    config = get_config_manager()
+    asset = config.asset_by_id(asset_id)
+    if not asset:
+        raise HTTPException(404, f"资源不存在: {asset_id}")
+    _ensure_inbox_for_postprocess(config, asset)
+    _sync_inbox_before_render(config, asset, body)
+    stack = _resolve_postprocess_stack(config, asset, body.get("stack"))
+    if not stack:
+        raise HTTPException(400, "无效 stack")
+    resolver = _pp_resolver(config, asset, body.get("subject_path"))
+    subj = stack.subject_layer()
+    if not subj:
+        raise HTTPException(400, "未找到主体图层")
+    subj_idx = stack.layers.index(subj)
+
+    art_root = config.art_root()
+    layers_dir = art_root / "postprocess" / "layers"
+    try:
+        new_layers, meta = smart_split_subject_layer(
+            stack,
+            resolver,
+            layers_dir=layers_dir,
+            alpha_threshold=int(body.get("alpha_threshold", 8)),
+            min_area=int(body.get("min_area", 64)),
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    for i, layer in enumerate(new_layers):
+        stack.layers.insert(subj_idx + 1 + i, layer)
+
+    config.set_postprocess_stack(asset_id, stack)
+    reload_config_manager()
+    log_bus.log(
+        f"智能拆分: {meta['count']} 个图层（{asset.filename}）",
+        kind="操作",
+    )
+    return {
+        "stack": stack_to_dict(stack),
+        "count": meta["count"],
+        "new_layer_ids": [layer.id for layer in new_layers],
+        "regions": meta.get("regions", []),
+    }
+
+
+@router.post("/assets/{asset_id}/postprocess/merge-layers")
+def merge_postprocess_layers(asset_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    """将多个图层合并为一个图片图层。"""
+    from postprocess.merge import merge_stack_layers
+    from postprocess.models import stack_to_dict
+
+    config = get_config_manager()
+    asset = config.asset_by_id(asset_id)
+    if not asset:
+        raise HTTPException(404, f"资源不存在: {asset_id}")
+    _ensure_inbox_for_postprocess(config, asset)
+    _sync_inbox_before_render(config, asset, body)
+    stack = _resolve_postprocess_stack(config, asset, body.get("stack"))
+    if not stack:
+        raise HTTPException(400, "无效 stack")
+    layer_ids = body.get("layer_ids") or []
+    if not isinstance(layer_ids, list) or len(layer_ids) < 2:
+        raise HTTPException(400, "请至少选择两个图层")
+
+    resolver = _pp_resolver(config, asset, body.get("subject_path"))
+    art_root = config.art_root()
+    layers_dir = art_root / "postprocess" / "layers"
+    removed_ids = [str(lid) for lid in layer_ids if lid]
+    try:
+        new_layer = merge_stack_layers(
+            stack,
+            resolver,
+            removed_ids,
+            layers_dir=layers_dir,
+            tight=body.get("tight", True) is not False,
+            merged_name=str(body.get("merged_name") or "").strip() or None,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    config.set_postprocess_stack(asset_id, stack)
+    reload_config_manager()
+    log_bus.log(
+        f"合并图层: {new_layer.name} ← {len(removed_ids)} 层（{asset.filename}）",
+        kind="操作",
+    )
+    return {
+        "stack": stack_to_dict(stack),
+        "new_layer_id": new_layer.id,
+        "removed_layer_ids": removed_ids,
+        "merged_name": new_layer.name,
+    }
+
+
+@router.post("/assets/{asset_id}/postprocess/export-merged")
+def export_postprocess_merged(asset_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    """合并导出：将全部可见图层合成一张 PNG。"""
+    from postprocess.engine import render_stack_to_png_bytes
+
+    config = get_config_manager()
+    asset = config.asset_by_id(asset_id)
+    if not asset:
+        raise HTTPException(404, f"资源不存在: {asset_id}")
+    _ensure_inbox_for_postprocess(config, asset)
+    _sync_inbox_before_render(config, asset, body)
+    stack = _resolve_postprocess_stack(config, asset, body.get("stack"))
+    if not stack:
+        raise HTTPException(400, "无效 stack")
+    resolver = _pp_resolver(config, asset, body.get("subject_path"))
+    try:
+        data = render_stack_to_png_bytes(stack, resolver)
+    except Exception as exc:
+        raise HTTPException(500, str(exc)) from exc
+    if not data:
+        raise HTTPException(500, "合成结果为空")
+
+    stem = Path(asset.filename or asset_id).stem
+    default_name = f"{stem}_merged.png"
+    output_path: Path | None = None
+    if body.get("output_path"):
+        output_path = Path(str(body["output_path"])).expanduser()
+    elif body.get("pick_path", True):
+        initial = _resolve_pick_initial_dir(config, body.get("initial_dir"))
+        picked = _pick_save_png_path(
+            initial,
+            default_name,
+            str(body.get("title") or "保存合成图"),
+        )
+        if not picked:
+            return {"cancelled": True}
+        output_path = picked
+    else:
+        output_path = _default_export_dir(config, asset) / default_name
+
+    if output_path.suffix.lower() != ".png":
+        output_path = output_path.with_suffix(".png")
+    _write_bytes_atomic(output_path, data)
+    log_bus.log(f"合并导出: {output_path.name} ({asset.filename})", kind="操作")
+    art_root = config.art_root()
+    return {
+        "cancelled": False,
+        "path": str(output_path.resolve()),
+        "relative": _rel_to_art_root(output_path, art_root),
+        "bytes": len(data),
+        "width": stack.canvas_width,
+        "height": stack.canvas_height,
+    }
+
+
+@router.post("/assets/{asset_id}/postprocess/export-layers")
+def export_postprocess_layers(asset_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    """多图层导出：各可见图层单独 PNG（默认 tight bbox），并写入 manifest.json。"""
+    from postprocess.engine import render_layer_export_png_bytes
+
+    config = get_config_manager()
+    asset = config.asset_by_id(asset_id)
+    if not asset:
+        raise HTTPException(404, f"资源不存在: {asset_id}")
+    _ensure_inbox_for_postprocess(config, asset)
+    _sync_inbox_before_render(config, asset, body)
+    stack = _resolve_postprocess_stack(config, asset, body.get("stack"))
+    if not stack:
+        raise HTTPException(400, "无效 stack")
+    resolver = _pp_resolver(config, asset, body.get("subject_path"))
+
+    include_hidden = bool(body.get("include_hidden"))
+    tight_crop = body.get("tight_crop", True) is not False
+
+    output_dir: Path | None = None
+    if body.get("output_dir"):
+        output_dir = Path(str(body["output_dir"])).expanduser()
+    elif body.get("pick_dir", True):
+        initial = _resolve_pick_initial_dir(config, body.get("initial_dir"))
+        picked = _pick_output_dir(initial, str(body.get("title") or "选择导出文件夹"))
+        if not picked:
+            return {"cancelled": True}
+        output_dir = picked
+    else:
+        output_dir = _default_export_dir(config, asset)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem = Path(asset.filename or asset_id).stem
+    subdir = output_dir / f"{stem}_layers"
+    subdir.mkdir(parents=True, exist_ok=True)
+
+    exported: list[dict[str, Any]] = []
+    used_names: dict[str, int] = {}
+    for layer in stack.layers:
+        if not include_hidden and layer.visible is False:
+            continue
+        try:
+            data, meta = render_layer_export_png_bytes(
+                stack,
+                resolver,
+                layer.id,
+                tight=bool(tight_crop),
+            )
+        except Exception as exc:
+            log_bus.log(f"图层导出跳过 {layer.name}: {exc}", kind="系统")
+            continue
+        if not data or meta.get("width", 0) <= 0 or meta.get("height", 0) <= 0:
+            continue
+        base = _safe_export_stem(layer.name or "", layer.id)
+        count = used_names.get(base, 0)
+        used_names[base] = count + 1
+        fname = f"{base}.png" if count == 0 else f"{base}_{count + 1}.png"
+        out_path = subdir / fname
+        _write_bytes_atomic(out_path, data)
+        exported.append(
+            {
+                "id": layer.id,
+                "name": layer.name,
+                "type": layer.type,
+                "file": fname,
+                "path": str(out_path.resolve()),
+                "offset_x": meta["offset_x"],
+                "offset_y": meta["offset_y"],
+                "width": meta["width"],
+                "height": meta["height"],
+            }
+        )
+
+    if not exported:
+        raise HTTPException(400, "没有可导出的可见图层")
+
+    manifest = {
+        "asset_id": asset_id,
+        "filename": asset.filename,
+        "canvas_width": stack.canvas_width,
+        "canvas_height": stack.canvas_height,
+        "tight_crop": bool(tight_crop),
+        "layers": exported,
+    }
+    manifest_path = subdir / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    log_bus.log(
+        f"多图层导出: {len(exported)} 个文件 → {subdir.name} ({asset.filename})",
+        kind="操作",
+    )
+    art_root = config.art_root()
+    return {
+        "cancelled": False,
+        "dir": str(subdir.resolve()),
+        "relative": _rel_to_art_root(subdir, art_root),
+        "count": len(exported),
+        "layers": exported,
+        "manifest": str(manifest_path.resolve()),
+    }
 
 
 @router.post("/assets/{asset_id}/export-unity")
@@ -2231,22 +3124,99 @@ def postprocess_fonts() -> dict[str, Any]:
 def pick_image_file(body: PickImageFileBody | None = None) -> dict[str, Any]:
     config = get_config_manager()
     art_root = config.art_root()
-    initial = art_root
-    if body and body.initial_dir:
-        cand = Path(body.initial_dir).expanduser()
-        if cand.is_dir():
-            initial = cand
-        elif cand.parent.is_dir():
-            initial = cand.parent
+    initial = _resolve_pick_initial_dir(config, body.initial_dir if body else None)
     picked = _pick_image_path(initial)
     if not picked:
         return {"cancelled": True}
     if not picked.is_file():
         raise HTTPException(400, "所选路径不是文件")
+    resolved = picked.resolve()
     return {
         "cancelled": False,
-        "path": _rel_to_art_root(picked, art_root),
-        "absolute": str(picked.resolve()),
+        "path": str(resolved),
+        "absolute": str(resolved),
+        "relative": _rel_to_art_root(resolved, art_root),
+    }
+
+
+@router.post("/pick-save-png")
+def pick_save_png(body: PickSavePngBody | None = None) -> dict[str, Any]:
+    config = get_config_manager()
+    art_root = config.art_root()
+    body = body or PickSavePngBody()
+    initial = _resolve_pick_initial_dir(config, body.initial_dir)
+    picked = _pick_save_png_path(initial, body.default_name, body.title or "保存 PNG")
+    if not picked:
+        return {"cancelled": True}
+    return {
+        "cancelled": False,
+        "path": str(picked.resolve()),
+        "relative": _rel_to_art_root(picked, art_root),
+    }
+
+
+@router.post("/pick-output-dir")
+def pick_output_dir(body: PickOutputDirBody | None = None) -> dict[str, Any]:
+    config = get_config_manager()
+    art_root = config.art_root()
+    body = body or PickOutputDirBody()
+    initial = _resolve_pick_initial_dir(config, body.initial_dir)
+    picked = _pick_output_dir(initial, body.title or "选择文件夹")
+    if not picked:
+        return {"cancelled": True}
+    rel_base = (body.relative_base or "art").strip().lower()
+    relative = ""
+    if rel_base == "art":
+        relative = _rel_to_art_root(picked, art_root)
+    elif rel_base == "project":
+        relative = config.rel_to_project(picked)
+    return {
+        "cancelled": False,
+        "path": str(picked.resolve()),
+        "relative": relative or str(picked.resolve()),
+    }
+
+
+@router.post("/validate-path")
+def validate_path_endpoint(body: ValidatePathBody) -> dict[str, Any]:
+    config = get_config_manager()
+    raw = (body.path or "").strip()
+    if not raw:
+        if body.optional:
+            return {"valid": True, "empty": True, "exists": False}
+        return {"valid": False, "empty": True, "message": "路径不能为空"}
+
+    kind = (body.kind or "dir").strip().lower()
+    base = (body.base or "absolute").strip().lower()
+    try:
+        resolved = _resolve_user_path(config, raw, base)
+    except (ValueError, OSError) as exc:
+        return {"valid": False, "message": str(exc) or "路径格式无效"}
+
+    exists = resolved.exists()
+    if kind == "dir":
+        ok = resolved.is_dir() if exists else True
+        wrong_type = exists and not resolved.is_dir()
+    elif kind == "file":
+        ok = resolved.is_file() if exists else True
+        wrong_type = exists and not resolved.is_file()
+    else:
+        ok = True
+        wrong_type = False
+
+    if wrong_type:
+        msg = "路径存在但不是文件夹" if kind == "dir" else "路径存在但不是文件"
+        return {
+            "valid": False,
+            "exists": True,
+            "resolved": str(resolved),
+            "message": msg,
+        }
+
+    return {
+        "valid": ok,
+        "exists": exists,
+        "resolved": str(resolved),
     }
 
 
@@ -2280,9 +3250,64 @@ async def upload_postprocess_image(file: UploadFile = File(...)) -> dict[str, st
 
 # ── AI ─────────────────────────────────────────────
 
-AI_MODES = ("free", "prompt", "refine", "workflow", "basic")
+AI_MODES = ("free", "prompt", "refine", "workflow", "basic", "category")
 
-_ai_histories: dict[str, list[dict[str, Any]]] = {}
+
+def _ai_histories_path() -> Path:
+    root = user_data_dir()
+    root.mkdir(parents=True, exist_ok=True)
+    return root / "ai_chat_histories.json"
+
+
+def _load_ai_histories() -> dict[str, list[dict[str, Any]]]:
+    path = _ai_histories_path()
+    if not path.is_file():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, list[dict[str, Any]]] = {}
+    for key, items in raw.items():
+        if not isinstance(key, str) or not isinstance(items, list):
+            continue
+        cleaned: list[dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            role = item.get("role")
+            content = item.get("content")
+            if role not in ("user", "assistant") or not isinstance(content, str):
+                continue
+            entry: dict[str, Any] = {"role": role, "content": content}
+            if item.get("failed"):
+                entry["failed"] = True
+                retry = item.get("retry_message")
+                if isinstance(retry, str):
+                    entry["retry_message"] = retry
+            cleaned.append(entry)
+        if cleaned:
+            out[key] = cleaned
+    return out
+
+
+def _save_ai_histories() -> None:
+    path = _ai_histories_path()
+    tmp = path.with_suffix(".tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(
+            json.dumps(_ai_histories, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tmp.replace(path)
+    except OSError:
+        pass
+
+
+_ai_histories: dict[str, list[dict[str, Any]]] = _load_ai_histories()
 
 
 def _ai_append_failed_turn(hist: list[dict[str, Any]], user_text: str, error: str) -> None:
@@ -2325,6 +3350,7 @@ def ai_clear(asset_id: str, mode: str | None = None) -> dict[str, str]:
         for m in AI_MODES:
             _ai_histories.pop(_ai_hist_key(asset_id, m), None)
         _ai_histories.pop(asset_id, None)
+    _save_ai_histories()
     return {"status": "cleared"}
 
 
@@ -2379,7 +3405,26 @@ def _apply_ai_basic_updates(config: Any, asset: Any, updates: dict[str, Any], ap
 
 
 def _apply_ai_prompt_updates(config: Any, asset: Any, updates: dict[str, Any], applied: list[str]) -> None:
-    from ai_assistant import _ai_update_present
+    from ai_assistant import (
+        collect_cloud_negative_update,
+        collect_cloud_prompt_update,
+        updates_intent_cloud_prompt,
+        _ai_field_set,
+    )
+    from cloud.registry import is_cloud_checkpoint
+
+    is_cloud = is_cloud_checkpoint(config.checkpoint_for_asset(asset))
+    cloud_intent = updates_intent_cloud_prompt(updates)
+    if is_cloud or cloud_intent:
+        prompt = collect_cloud_prompt_update(updates)
+        if prompt is not None:
+            asset.cloud_prompt = prompt
+            applied.append("cloud_prompt")
+        negative = collect_cloud_negative_update(updates)
+        if negative is not None:
+            asset.cloud_negative = negative
+            applied.append("cloud_negative")
+        return
 
     for key in (
         "positive_prefix",
@@ -2392,7 +3437,7 @@ def _apply_ai_prompt_updates(config: Any, asset: Any, updates: dict[str, Any], a
         "negative",
         "subject",
     ):
-        if _ai_update_present(updates.get(key)):
+        if _ai_field_set(updates, key):
             setattr(asset, key, str(updates[key]).strip())
             applied.append(key)
     config.sync_asset_prompt_fields(asset)
@@ -2422,13 +3467,13 @@ def _apply_ai_gen_updates(asset: Any, updates: dict[str, Any], applied: list[str
 
 
 def _apply_ai_category_updates(cat: Any, cat_updates: dict[str, Any], applied: list[str]) -> bool:
-    from ai_assistant import _ai_update_present
+    from ai_assistant import _ai_field_set, _ai_update_present
 
     if not cat or not isinstance(cat_updates, dict):
         return False
     changed = False
     for key in _CAT_SETTING_KEYS:
-        if not _ai_update_present(cat_updates.get(key)):
+        if not _ai_field_set(cat_updates, key) and not _ai_update_present(cat_updates.get(key)):
             continue
         val = cat_updates[key]
         if key == "alpha_matte":
@@ -2484,11 +3529,20 @@ def _apply_all_ai_updates(
 
 def _ai_context_for_asset(config: Any, asset: Any) -> str:
     from ai_assistant import build_context_message
+    from cloud.registry import is_cloud_checkpoint
 
     cat = config.category_by_id(asset.category)
     wf_path = config.workflow_file_for_asset(asset)
     wf_summary = wf_path.name if wf_path.is_file() else "默认"
     cat_opts = ", ".join(f"{c.id}({c.label})" for c in config.categories())
+    eff_ckpt = config.checkpoint_for_asset(asset)
+    cloud_label = ""
+    if is_cloud_checkpoint(eff_ckpt):
+        from cloud.registry import get_model
+
+        m = get_model(eff_ckpt)
+        if m:
+            cloud_label = str(m.get("label_zh") or m.get("label_en") or "")
     return build_context_message(
         asset_id=asset.id,
         filename=asset.filename,
@@ -2518,7 +3572,13 @@ def _ai_context_for_asset(config: Any, asset: Any) -> str:
         category_positive_common=cat.positive_common if cat else "",
         category_negative_common=cat.negative_common if cat else "",
         asset_checkpoint=getattr(asset, "checkpoint", "") or "",
-        effective_checkpoint=config.checkpoint_for_asset(asset),
+        effective_checkpoint=eff_ckpt,
+        is_cloud_model=is_cloud_checkpoint(eff_ckpt),
+        cloud_prompt=getattr(asset, "cloud_prompt", ""),
+        cloud_negative=getattr(asset, "cloud_negative", ""),
+        cloud_gen_mode=getattr(asset, "cloud_gen_mode", "text_to_image"),
+        cloud_strength=float(getattr(asset, "cloud_strength", 0.65)),
+        cloud_model_label=cloud_label,
         gen_mode=getattr(asset, "gen_mode", "txt2img"),
         ref_image=getattr(asset, "ref_image", ""),
         img2img_denoise=float(getattr(asset, "img2img_denoise", 0.65)),
@@ -2540,7 +3600,8 @@ def ai_verify(body: dict[str, Any]) -> dict[str, Any]:
 
 @router.post("/ai/chat")
 def ai_chat(body: AiChatBody) -> dict[str, Any]:
-    from ai_assistant import AiAssistantError, chat, parse_ai_response
+    from ai_assistant import AiAssistantError, ai_mode_prefix, chat, parse_ai_response
+    from cloud.registry import is_cloud_checkpoint
 
     config = get_config_manager()
     asset = config.asset_by_id(body.asset_id)
@@ -2550,25 +3611,8 @@ def ai_chat(body: AiChatBody) -> dict[str, Any]:
     api_key = str(d.get("deepseek_api_key", ""))
     model = str(d.get("deepseek_model", ""))
     mode = body.mode if body.mode in AI_MODES else "free"
-    mode_prefix = {
-        "free": (
-            "【任务：根据用户意图配置当前资源；可同时填写基本信息、当前分类的 category_settings、"
-            "提示词、gen_mode/ref_image/img2img_denoise、工作流。updates 中未改字段设为 null；用户未提及的不要改】\n"
-        ),
-        "prompt": (
-            "【任务：按四段结构生成或重写 ComfyUI 提示词：positive_prefix / positive_subject / "
-            "positive_scene / positive_light + negative；未改段设为 null】\n"
-        ),
-        "refine": (
-            "【任务：在四段提示词基础上按用户要求微调（prefix/subject/scene/light/negative），"
-            "保留未提及段的合理内容；未改段设为 null】\n"
-        ),
-        "workflow": "【任务：处理 ComfyUI 工作流 JSON；仅用户明确要求改结构时才返回 workflow】\n",
-        "basic": (
-            "【任务：填写或修改资源「基本信息」页（subject、filename、分类、宽×高、seed、启用、剔除背景、checkpoint）；"
-            "updates 中未改字段设为 null；不要改 prompt/workflow/category_settings】\n"
-        ),
-    }.get(mode, "")
+    is_cloud = is_cloud_checkpoint(config.checkpoint_for_asset(asset))
+    mode_prefix = ai_mode_prefix(mode, is_cloud_model=is_cloud)
     user_text = body.message.strip()
     if not user_text:
         raise HTTPException(400, "消息不能为空")
@@ -2585,12 +3629,15 @@ def ai_chat(body: AiChatBody) -> dict[str, Any]:
         message, updates = parse_ai_response(raw)
     except AiAssistantError as exc:
         _ai_append_failed_turn(hist, user_text, str(exc))
+        _save_ai_histories()
         raise HTTPException(502, str(exc)) from exc
     except Exception as exc:
         _ai_append_failed_turn(hist, user_text, f"AI 请求失败: {exc}")
+        _save_ai_histories()
         raise HTTPException(502, f"AI 请求失败: {exc}") from exc
     hist.append({"role": "user", "content": user_text})
     hist.append({"role": "assistant", "content": message})
+    _save_ai_histories()
     applied: list[str] = []
     cat_dirty = _apply_all_ai_updates(config, asset, updates, applied)
     asset_dirty = any(not k.startswith("cat.") for k in applied)
@@ -2607,7 +3654,18 @@ def ai_chat(body: AiChatBody) -> dict[str, Any]:
             f"AI 已自动保存资源 {asset.id}（{', '.join(applied)}）",
             kind="操作",
         )
-    return {"message": message, "applied": applied, "updates": updates, "saved": bool(applied)}
+    elif updates:
+        log_bus.log(
+            f"AI 未写入配置 {asset.id}（返回字段: {', '.join(updates.keys())}）",
+            kind="系统",
+        )
+    return {
+        "message": message,
+        "applied": applied,
+        "updates": updates,
+        "saved": bool(applied),
+        "is_cloud_backend": is_cloud,
+    }
 
 
 # ── System open ─────────────────────────────────────────────

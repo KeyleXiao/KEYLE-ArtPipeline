@@ -24,5 +24,8 @@ inbox/**/*.jpeg
 tools/workflows/assets/*
 !tools/workflows/assets/.gitkeep
 
+# 项目开发中的资源清单（本地测试分类，不入库）
+manifest/hud_v8.yaml
+
 .env
 .env.*

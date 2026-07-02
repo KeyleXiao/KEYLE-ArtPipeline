@@ -22,6 +22,8 @@ import {
   showGlobalOverlay,
   withBtnBusy,
 } from "./effects.js";
+import { closeLogDrawer, initLogPanel } from "./log-panel.js";
+import { initPathFields, validatePathFields } from "./path-input.js";
 
 const state = {
   categories: [],
@@ -36,8 +38,6 @@ const state = {
   checkpoints: [],
   cloudModels: [],
   cloudGenModes: {},
-  logFilter: "全部",
-  logEs: null,
   jobTimer: null,
   jobRunId: null,
   jobTrack: { active: false, sawBusy: false, postOk: false, submittedAt: 0 },
@@ -51,6 +51,10 @@ const state = {
   aiBusy: false,
   aiChatHistory: [],
   workflowPresets: [],
+  /** 资源列表多选（顺序与当前列表一致） */
+  selectedAssetIds: [],
+  /** Shift 范围选择的锚点 */
+  lastAssetClickId: null,
 };
 
 let genModeHydrating = false;
@@ -67,9 +71,19 @@ const previewView = {
 };
 
 let appBooted = false;
+/** 上次 ComfyUI 在线状态；用于检测离线→在线后刷新本地 checkpoint 列表 */
+let comfyOnlineLast = null;
 
-const AI_MODE_KEYS = ["free", "prompt", "refine", "workflow", "basic"];
+const AI_MODE_KEYS = ["free", "prompt", "refine", "workflow", "basic", "category"];
 const AI_INTRO_DISMISSED_KEY = "aiIntroDismissed";
+/** 各资源进行中的 AI 请求数（切换资源后会话独立，互不影响 UI） */
+const aiPendingCounts = new Map();
+/** 资源切换序号，用于丢弃过期的表单/预览加载 */
+let assetLoadSeq = 0;
+
+function isStaleAssetLoad(loadSeq, assetId = state.assetId) {
+  return loadSeq !== assetLoadSeq || !assetId || state.assetId !== assetId;
+}
 let aiIntroAutoHideTimer = null;
 let aiIntroAutoHideScheduled = false;
 let aiIntroDismissedMemory = false;
@@ -159,26 +173,134 @@ function setFormError(form, msg) {
   }
 }
 
+function effectiveSelectedIds() {
+  const visible = new Set(state.assets.map((a) => a.id));
+  const sel = state.selectedAssetIds.filter((id) => visible.has(id));
+  if (sel.length) return sel;
+  return state.assetId && visible.has(state.assetId) ? [state.assetId] : [];
+}
+
 function selectedIds() {
-  return state.assetId ? [state.assetId] : [];
+  return effectiveSelectedIds();
+}
+
+function isAssetRowSelected(assetId) {
+  if (state.selectedAssetIds.length) return state.selectedAssetIds.includes(assetId);
+  return assetId === state.assetId;
+}
+
+function toggleAssetInSelection(assetId) {
+  const ordered = state.assets.map((a) => a.id);
+  const base =
+    state.selectedAssetIds.length > 0
+      ? state.selectedAssetIds
+      : state.assetId
+        ? [state.assetId]
+        : [];
+  const set = new Set(base);
+  if (set.has(assetId)) {
+    set.delete(assetId);
+    if (!set.size) set.add(assetId);
+  } else {
+    set.add(assetId);
+  }
+  return ordered.filter((id) => set.has(id));
+}
+
+function handleAssetListClick(assetId, ev) {
+  const ordered = state.assets.map((a) => a.id);
+  const idx = ordered.indexOf(assetId);
+  if (idx < 0) return;
+
+  const shift = ev.shiftKey;
+  const toggle = ev.metaKey || ev.ctrlKey;
+
+  if (shift && state.lastAssetClickId) {
+    const anchor = ordered.indexOf(state.lastAssetClickId);
+    if (anchor >= 0) {
+      const lo = Math.min(anchor, idx);
+      const hi = Math.max(anchor, idx);
+      const range = ordered.slice(lo, hi + 1);
+      if (toggle) {
+        const set = new Set(
+          state.selectedAssetIds.length
+            ? state.selectedAssetIds
+            : state.assetId
+              ? [state.assetId]
+              : [],
+        );
+        for (const id of range) {
+          if (set.has(id)) set.delete(id);
+          else set.add(id);
+        }
+        state.selectedAssetIds = ordered.filter((id) => set.has(id));
+        if (!state.selectedAssetIds.length) state.selectedAssetIds = [assetId];
+      } else {
+        state.selectedAssetIds = range;
+      }
+    } else {
+      state.selectedAssetIds = toggle ? toggleAssetInSelection(assetId) : [assetId];
+    }
+  } else if (toggle) {
+    state.selectedAssetIds = toggleAssetInSelection(assetId);
+  } else {
+    state.selectedAssetIds = [assetId];
+  }
+  state.lastAssetClickId = assetId;
+}
+
+function pruneAssetSelection() {
+  const visible = new Set(state.assets.map((a) => a.id));
+  state.selectedAssetIds = state.selectedAssetIds.filter((id) => visible.has(id));
+  if (state.lastAssetClickId && !visible.has(state.lastAssetClickId)) {
+    state.lastAssetClickId = state.selectedAssetIds[0] || state.assetId || null;
+  }
 }
 
 function categoryAssetIds() {
   return state.assets.filter((a) => a.enabled !== false).map((a) => a.id);
 }
 
-async function enabledAssetIdsForCategory(catId) {
-  if (catId === state.categoryId) return categoryAssetIds();
+async function enabledAssetsForCategory(catId) {
+  if (catId === state.categoryId) {
+    const assets = state.assets.filter((a) => a.enabled !== false);
+    return { ids: assets.map((a) => a.id), assets };
+  }
   const data = await API.get(`/api/assets?category=${encodeURIComponent(catId)}`);
-  return (data.assets || []).filter((a) => a.enabled !== false).map((a) => a.id);
+  const assets = (data.assets || []).filter((a) => a.enabled !== false);
+  return { ids: assets.map((a) => a.id), assets };
 }
 
-async function runGenerate(assetIds, { exportAfter = false, emptyToastKey = "toast.noCategoryAssets" } = {}) {
+function effectiveCheckpointFromRow(row) {
+  if (!row) return "";
+  if (row.checkpoint_effective) return row.checkpoint_effective;
+  if (row.checkpoint) return row.checkpoint;
+  const cat = state.categories.find((c) => c.id === row.category);
+  return cat?.checkpoint || "";
+}
+
+function assetUsesCloudBackendFromRow(row) {
+  if (!row) return false;
+  if (row.is_cloud_model === true) return true;
+  if (row.is_cloud_model === false) return false;
+  return isCloudCheckpoint(effectiveCheckpointFromRow(row));
+}
+
+function batchNeedsComfy(assetIds, assetRows = null) {
+  const byId = new Map((assetRows || state.assets).map((a) => [a.id, a]));
+  return (assetIds || []).some((id) => !assetUsesCloudBackendFromRow(byId.get(id)));
+}
+
+async function runGenerate(
+  assetIds,
+  { exportAfter = false, emptyToastKey = "toast.noCategoryAssets", assetRows = null } = {},
+) {
   if (!assetIds?.length) {
     toast(t(emptyToastKey));
     return;
   }
-  if (batchNeedsComfy(assetIds) && !(await ensureComfyOnline())) return;
+  const rows = assetRows || state.assets;
+  if (batchNeedsComfy(assetIds, rows) && !(await ensureComfyOnline())) return;
   if (state.assetId && assetIds.includes(state.assetId)) {
     if (assetUsesCloudBackend()) {
       await persistCloudAssetFields();
@@ -298,15 +420,26 @@ function renderAssets() {
     if (countEl) countEl.textContent = "";
     return;
   }
+  const selCount = effectiveSelectedIds().length;
   if (countEl) {
-    countEl.textContent = state.statusScanning
-      ? t("asset.countScanning", { n: state.assets.length })
-      : t("asset.count", { n: state.assets.length });
+    if (selCount > 1) {
+      countEl.textContent = state.statusScanning
+        ? t("asset.countSelectedScanning", { n: state.assets.length, sel: selCount })
+        : t("asset.countSelected", { n: state.assets.length, sel: selCount });
+    } else {
+      countEl.textContent = state.statusScanning
+        ? t("asset.countScanning", { n: state.assets.length })
+        : t("asset.count", { n: state.assets.length });
+    }
   }
   const frag = document.createDocumentFragment();
   for (const asset of state.assets) {
     const row = document.createElement("div");
-    row.className = "asset-row" + (asset.id === state.assetId ? " active" : "");
+    const selected = isAssetRowSelected(asset.id);
+    row.className =
+      "asset-row" +
+      (asset.id === state.assetId ? " active" : "") +
+      (selected ? " selected" : "");
     row.dataset.id = asset.id;
     const st = state.statusMap[asset.id];
     const chips = PATH_KINDS.map(({ key, label }) =>
@@ -323,7 +456,8 @@ function renderAssets() {
         ev.stopPropagation();
         return;
       }
-      selectAsset(asset.id);
+      handleAssetListClick(asset.id, ev);
+      void selectAsset(asset.id, { keepSelection: true });
     });
     frag.appendChild(row);
   }
@@ -349,11 +483,7 @@ function resolveCheckpointForAssetId(assetId) {
     return effectiveCheckpointForAsset(state.assetFull);
   }
   const row = state.assets.find((a) => a.id === assetId);
-  return row?.checkpoint_effective || row?.checkpoint || "";
-}
-
-function batchNeedsComfy(assetIds) {
-  return (assetIds || []).some((id) => !isCloudCheckpoint(resolveCheckpointForAssetId(id)));
+  return effectiveCheckpointFromRow(row);
 }
 
 function cloudProviderFromCheckpoint(checkpoint) {
@@ -571,23 +701,6 @@ async function saveCloudGenModeOnly() {
   }
 }
 
-async function pickCloudRefImage(btn) {
-  await withBtnBusy(btn || document.querySelector('[data-action="pick-cloud-ref-image"]'), async () => {
-    const path = await pickRefImageFile();
-    if (!path) return;
-    genModeHydrating = true;
-    $$('input[name="cloud_gen_mode"]').forEach((r) => {
-      if (r.value === "image_to_image") r.checked = true;
-    });
-    $("#cloud-ref-image-path").value = path;
-    genModeHydrating = false;
-    updateCloudGenModeUi();
-    await saveCloudGenModeOnly();
-  }).catch((err) => {
-    if (err) toast(err.message);
-  });
-}
-
 async function persistCloudAssetFields() {
   if (!state.assetId || genModeHydrating) return;
   const body = {
@@ -664,9 +777,14 @@ function fillCategorySelect() {
   }
 }
 
-async function loadBasicForm() {
-  if (!state.assetId) return;
-  const data = state.assetFull || (await API.get(`/api/assets/${state.assetId}`));
+async function loadBasicForm(loadSeq = assetLoadSeq) {
+  if (!state.assetId || isStaleAssetLoad(loadSeq)) return;
+  const assetId = state.assetId;
+  let data = state.assetFull?.id === assetId ? state.assetFull : null;
+  if (!data) {
+    data = await API.get(`/api/assets/${assetId}`);
+    if (isStaleAssetLoad(loadSeq, assetId)) return;
+  }
   state.assetFull = data;
   const form = $("#form-basic");
   if (!form) return;
@@ -698,11 +816,39 @@ async function loadCategoryForm() {
   form.positive_common.value = data.positive_common || "";
   form.negative_common.value = data.negative_common || "";
   rebuildCheckpointSelect($("#cat-ckpt"), t("form.checkpointUnset"), data.checkpoint || "");
+  initPathFields(form);
 }
 
-async function loadComfyUiTab() {
-  if (!state.assetId) return;
-  const data = state.assetFull || (await API.get(`/api/assets/${state.assetId}`));
+function bindPathFieldSideEffects() {
+  $("#ref-image-path")?.addEventListener("pathpicked", async () => {
+    genModeHydrating = true;
+    $$('input[name="gen_mode"]').forEach((r) => {
+      if (r.value === "img2img") r.checked = true;
+    });
+    genModeHydrating = false;
+    updateGenModeUi();
+    await saveGenModeOnly();
+  });
+
+  $("#cloud-ref-image-path")?.addEventListener("pathpicked", async () => {
+    genModeHydrating = true;
+    $$('input[name="cloud_gen_mode"]').forEach((r) => {
+      if (r.value === "image_to_image") r.checked = true;
+    });
+    genModeHydrating = false;
+    updateCloudGenModeUi();
+    await saveCloudGenModeOnly();
+  });
+}
+
+async function loadComfyUiTab(loadSeq = assetLoadSeq) {
+  if (!state.assetId || isStaleAssetLoad(loadSeq)) return;
+  const assetId = state.assetId;
+  let data = state.assetFull?.id === assetId ? state.assetFull : null;
+  if (!data) {
+    data = await API.get(`/api/assets/${assetId}`);
+    if (isStaleAssetLoad(loadSeq, assetId)) return;
+  }
   state.assetFull = data;
   $("#positive-prefix-text").value = data.positive_prefix || "";
   $("#positive-subject-text").value = data.positive_subject || "";
@@ -732,17 +878,24 @@ async function loadComfyUiTab() {
   $("#img2img-denoise-range").value = denoise;
   updateGenModeUi();
   try {
-    const wf = await API.get(`/api/assets/${state.assetId}/workflow`);
+    const wf = await API.get(`/api/assets/${assetId}/workflow`);
+    if (isStaleAssetLoad(loadSeq, assetId)) return;
     $("#workflow-text").value = wf.text || "";
   } catch {
+    if (isStaleAssetLoad(loadSeq, assetId)) return;
     $("#workflow-text").value = "";
   }
   await refreshWorkflowPresetSelect();
 }
 
-async function loadCloudTab() {
-  if (!state.assetId) return;
-  const data = state.assetFull || (await API.get(`/api/assets/${state.assetId}`));
+async function loadCloudTab(loadSeq = assetLoadSeq) {
+  if (!state.assetId || isStaleAssetLoad(loadSeq)) return;
+  const assetId = state.assetId;
+  let data = state.assetFull?.id === assetId ? state.assetFull : null;
+  if (!data) {
+    data = await API.get(`/api/assets/${assetId}`);
+    if (isStaleAssetLoad(loadSeq, assetId)) return;
+  }
   state.assetFull = data;
   updateCloudTabHero(data);
   let cloudMode = data.cloud_gen_mode || "text_to_image";
@@ -751,8 +904,13 @@ async function loadCloudTab() {
     r.checked = r.value === cloudMode;
   });
   genModeHydrating = false;
-  $("#cloud-prompt-text").value = data.cloud_prompt || data.positive || "";
-  $("#cloud-negative-text").value = data.cloud_negative || data.negative || "";
+  if (assetUsesCloudBackend(data)) {
+    $("#cloud-prompt-text").value = data.cloud_prompt ?? "";
+    $("#cloud-negative-text").value = data.cloud_negative ?? "";
+  } else {
+    $("#cloud-prompt-text").value = data.cloud_prompt || data.positive || "";
+    $("#cloud-negative-text").value = data.cloud_negative || data.negative || "";
+  }
   $("#cloud-ref-image-path").value = data.ref_image || "";
   const strength = data.cloud_strength ?? data.img2img_denoise ?? 0.65;
   $("#cloud-strength").value = strength;
@@ -1013,28 +1171,11 @@ async function pickRefImageFile() {
   try {
     const r = await API.post("/api/pick-image-file", {});
     if (r.cancelled) return null;
-    return r.path || r.absolute || null;
+    return (r.path || r.absolute || "").trim() || null;
   } catch (err) {
     toast(err.message);
     return null;
   }
-}
-
-async function pickRefImage(btn) {
-  await withBtnBusy(btn || document.querySelector('[data-action="pick-ref-image"]'), async () => {
-    const path = await pickRefImageFile();
-    if (!path) return;
-    genModeHydrating = true;
-    $$('input[name="gen_mode"]').forEach((r) => {
-      if (r.value === "img2img") r.checked = true;
-    });
-    $("#ref-image-path").value = path;
-    genModeHydrating = false;
-    updateGenModeUi();
-    await saveGenModeOnly();
-  }).catch((err) => {
-    if (err) toast(err.message);
-  });
 }
 
 function resolveTencentApiKey(keys) {
@@ -1082,6 +1223,7 @@ async function loadSettingsForm() {
   state.apiPortals = data.api_portals || {};
   resetAllCloudApiStatuses();
   resetDeepseekApiStatus();
+  initPathFields(form);
 }
 
 const CLOUD_API_FIELD_MAP = {
@@ -1256,7 +1398,7 @@ function updateAiModeUi() {
   const hint = $("#ai-mode-hint");
   if (hint) hint.textContent = aiModeText(mode, "hint");
   const input = $("#ai-input");
-  if (input && !state.aiBusy) input.placeholder = aiModeText(mode, "placeholder");
+  if (input && !isAssetAiBusy(state.assetId)) input.placeholder = aiModeText(mode, "placeholder");
 }
 
 function renderAiChat(history = []) {
@@ -1321,7 +1463,28 @@ async function sendAiWithMessage(msg) {
   await sendAi();
 }
 
-function setAiBusy(busy) {
+function aiPendingCount(assetId) {
+  return aiPendingCounts.get(assetId) || 0;
+}
+
+function isAssetAiBusy(assetId) {
+  return Boolean(assetId) && aiPendingCount(assetId) > 0;
+}
+
+function beginAiRequest(assetId) {
+  aiPendingCounts.set(assetId, aiPendingCount(assetId) + 1);
+  if (assetId === state.assetId) syncAiBusyUi();
+}
+
+function endAiRequest(assetId) {
+  const next = aiPendingCount(assetId) - 1;
+  if (next <= 0) aiPendingCounts.delete(assetId);
+  else aiPendingCounts.set(assetId, next);
+  if (assetId === state.assetId) syncAiBusyUi();
+}
+
+function syncAiBusyUi() {
+  const busy = isAssetAiBusy(state.assetId);
   state.aiBusy = busy;
   const btn = $("#ai-send-btn");
   const input = $("#ai-input");
@@ -1367,6 +1530,7 @@ async function refreshAiMessages() {
   } catch {
     renderAiChat([]);
   }
+  if (isAssetAiBusy(state.assetId)) syncAiBusyUi();
 }
 
 function isAiIntroDismissed() {
@@ -1412,6 +1576,7 @@ async function openAiPanel() {
   setupAiIntroBanner();
   updateAiModeUi();
   await refreshAiMessages();
+  syncAiBusyUi();
 }
 
 async function switchAiMode(mode) {
@@ -1698,6 +1863,20 @@ function clearPreviewInfo() {
   $("#preview-activity").innerHTML = "";
 }
 
+function previewActivityMessage(msg) {
+  const m = String(msg || "").trim();
+  if (!m) return "";
+  // AI 自动保存若主要为提示词字段，不在详情面板展示
+  if (/AI 已自动保存|Auto-saved/i.test(m)) {
+    const inner = m.match(/[（(]([^）)]+)[）)]/)?.[1] || "";
+    if (inner && /(?:^|,\s*)(?:subject|positive|negative|cloud_prompt|cloud_negative)/i.test(inner)) {
+      return "";
+    }
+  }
+  if (/^\(?subject,\s*positive/i.test(m)) return "";
+  return m;
+}
+
 function renderPreviewInfo(info) {
   if (!info) {
     clearPreviewInfo();
@@ -1714,7 +1893,6 @@ function renderPreviewInfo(info) {
   if (nameEl) nameEl.textContent = info.filename || "—";
   if (subEl) {
     const parts = [info.size_label, sourceLabel];
-    if (info.subject) parts.push(info.subject);
     subEl.textContent = parts.filter(Boolean).join(" · ");
   }
 
@@ -1755,7 +1933,9 @@ function renderPreviewInfo(info) {
   }
 
   if (activityEl) {
-    const items = info.activity || [];
+    const items = (info.activity || [])
+      .map((entry) => ({ ...entry, msg: previewActivityMessage(entry.msg) }))
+      .filter((entry) => entry.msg);
     if (!items.length) {
       activityEl.innerHTML = `<li class="empty">${esc(t("preview.infoNoActivity"))}</li>`;
     } else {
@@ -1789,7 +1969,6 @@ async function loadPreviewInfo(assetId) {
       renderPreviewInfo({
         filename: asset.filename,
         size_label: asset.size_label,
-        subject: asset.subject || "",
         files: {},
         activity: [],
       });
@@ -1845,7 +2024,7 @@ function clearPreview() {
   }
 }
 
-async function loadPreview() {
+async function loadPreview({ bustCache = false } = {}) {
   const asset = state.assets.find((a) => a.id === state.assetId);
   if (!asset) {
     clearPreview();
@@ -1871,13 +2050,18 @@ async function loadPreview() {
     img.removeAttribute("src");
     if (ph) ph.hidden = true;
   }
-  loadPreviewInfo(asset.id);
+  await loadPreviewInfo(asset.id);
 
   const params = new URLSearchParams({
     source: currentPreviewSourceKey(),
     max: String(previewMaxSize()),
   });
-  const url = `/api/assets/${encodeURIComponent(asset.id)}/preview.png?${params}&_=${Date.now()}`;
+  const srcKey = currentPreviewSourceKey();
+  const mtime = state.previewInfo?.files?.[srcKey]?.mtime;
+  if (bustCache) params.set("v", String(Date.now()));
+  else if (mtime) params.set("v", String(Math.floor(mtime)));
+
+  const url = `/api/assets/${encodeURIComponent(asset.id)}/preview.png?${params}`;
 
   try {
     const res = await fetch(url);
@@ -1907,12 +2091,15 @@ async function loadPreview() {
   }
 }
 
-async function loadPaths() {
+async function loadPaths(loadSeq = assetLoadSeq) {
   if (!state.assetId) {
     state.paths = null;
     return;
   }
-  state.paths = await API.get(`/api/assets/${state.assetId}/paths`);
+  const assetId = state.assetId;
+  const paths = await API.get(`/api/assets/${assetId}/paths`);
+  if (isStaleAssetLoad(loadSeq, assetId)) return;
+  state.paths = paths;
   if (currentGenMode() === "redraw") updateGenModeUi();
 }
 
@@ -1928,6 +2115,7 @@ async function loadAssetList() {
       `/api/assets?category=${encodeURIComponent(state.categoryId)}&q=${encodeURIComponent(q)}`,
     );
     state.assets = data.assets || [];
+    pruneAssetSelection();
     renderAssets();
     updateMainTabsVisibility();
     scanStatus();
@@ -1945,6 +2133,8 @@ async function selectCategory(catId) {
     state.assetId = null;
     state.assetFull = null;
     state.statusMap = {};
+    state.selectedAssetIds = [];
+    state.lastAssetClickId = null;
     clearPreview();
   }
   renderCategories();
@@ -1960,17 +2150,26 @@ async function selectCategory(catId) {
   }
 }
 
-async function selectAsset(assetId) {
+async function selectAsset(assetId, { keepSelection = false } = {}) {
+  const loadSeq = ++assetLoadSeq;
+  if (!keepSelection) {
+    state.selectedAssetIds = assetId ? [assetId] : [];
+    if (assetId) state.lastAssetClickId = assetId;
+  }
   state.assetId = assetId;
   state.assetFull = null;
   renderAssets();
-  await loadPaths();
-  await loadBasicForm();
+  await loadPaths(loadSeq);
+  if (isStaleAssetLoad(loadSeq, assetId)) return;
+  await loadBasicForm(loadSeq);
+  if (isStaleAssetLoad(loadSeq, assetId)) return;
+  // 无论当前在哪个 Tab，都刷新提示词表单，避免切换资源后仍显示上一张图的内容
+  if (assetUsesCloudBackend()) await loadCloudTab(loadSeq);
+  else await loadComfyUiTab(loadSeq);
+  if (isStaleAssetLoad(loadSeq, assetId)) return;
   await loadPreview();
-  const activeTab = $("#main-tabs .tab.active")?.dataset.tab;
-  if (activeTab === "comfyui") await loadComfyUiTab();
-  else if (activeTab?.startsWith("cloud-")) await loadCloudTab();
-  if (activeTab === "ai") await openAiPanel();
+  if (isStaleAssetLoad(loadSeq, assetId)) return;
+  if ($("#main-tabs .tab.active")?.dataset.tab === "ai") await openAiPanel();
 }
 
 async function scanStatus() {
@@ -2649,16 +2848,30 @@ async function refreshComfy() {
   const pill = $("#comfy-pill");
   if (!pill) return false;
   pill.classList.add("is-checking");
+  const wasOnline = comfyOnlineLast;
   try {
     const data = await API.get("/api/comfyui/status");
-    pill.textContent = data.ok ? t("comfy.online") : t("comfy.offline");
-    pill.classList.toggle("ok", data.ok);
+    const ok = !!data.ok;
+    pill.textContent = ok ? t("comfy.online") : t("comfy.offline");
+    pill.classList.toggle("ok", ok);
     pill.title = data.message || "";
-    return !!data.ok;
+    comfyOnlineLast = ok;
+    if (ok && (wasOnline === false || (wasOnline === null && !(state.checkpoints?.length)))) {
+      void loadGenerationModels();
+    } else if (!ok && wasOnline === true) {
+      state.checkpoints = [];
+      fillCheckpointSelects();
+    }
+    return ok;
   } catch {
     pill.textContent = "ComfyUI ?";
     pill.classList.remove("ok");
     pill.title = "";
+    if (comfyOnlineLast === true) {
+      state.checkpoints = [];
+      fillCheckpointSelects();
+    }
+    comfyOnlineLast = false;
     return false;
   } finally {
     pill.classList.remove("is-checking");
@@ -2688,10 +2901,14 @@ function startJobPoll() {
 }
 
 async function startGenerate(exportAfter = false, onlySelected = false) {
+  const assets = onlySelected
+    ? state.assets.filter((a) => selectedIds().includes(a.id))
+    : state.assets.filter((a) => a.enabled !== false);
   const ids = onlySelected ? selectedIds() : categoryAssetIds();
   await runGenerate(ids, {
     exportAfter,
     emptyToastKey: onlySelected ? "toast.selectAsset" : "toast.noCategoryAssets",
+    assetRows: assets,
   });
 }
 
@@ -2700,210 +2917,6 @@ async function startExport(onlySelected = false) {
   await runExport(ids, {
     emptyToastKey: onlySelected ? "toast.selectAsset" : "toast.noCategoryAssets",
   });
-}
-
-// ── 日志 SSE ─────────────────────────────────────────────
-
-function openLogDrawer() {
-  const drawer = $("#log-drawer");
-  const fab = $("#log-fab");
-  drawer?.classList.add("open");
-  drawer?.setAttribute("aria-hidden", "false");
-  fab?.classList.add("active");
-  fab?.setAttribute("aria-expanded", "true");
-  const pre = $("#log-body");
-  if (pre) pre.scrollTop = pre.scrollHeight;
-}
-
-function closeLogDrawer() {
-  const drawer = $("#log-drawer");
-  const fab = $("#log-fab");
-  drawer?.classList.remove("open");
-  drawer?.setAttribute("aria-hidden", "true");
-  fab?.classList.remove("active");
-  fab?.setAttribute("aria-expanded", "false");
-}
-
-function toggleLogDrawer() {
-  if ($("#log-drawer")?.classList.contains("open")) closeLogDrawer();
-  else openLogDrawer();
-}
-
-const LOG_FAB_POS_KEY = "artApp.logFabPos";
-const LOG_FAB_DRAG_THRESHOLD = 5;
-
-function clampLogFabPosition(x, y, fab) {
-  const el = fab || $("#log-fab");
-  if (!el) return { x, y };
-  const pad = 8;
-  const w = el.offsetWidth || 48;
-  const h = el.offsetHeight || 28;
-  return {
-    x: Math.max(pad, Math.min(x, window.innerWidth - w - pad)),
-    y: Math.max(pad, Math.min(y, window.innerHeight - h - pad)),
-  };
-}
-
-function applyLogFabPosition(x, y, fab, persist = true) {
-  const el = fab || $("#log-fab");
-  if (!el) return;
-  const p = clampLogFabPosition(x, y, el);
-  el.style.left = `${p.x}px`;
-  el.style.top = `${p.y}px`;
-  el.style.right = "auto";
-  el.style.bottom = "auto";
-  if (persist) {
-    try {
-      localStorage.setItem(LOG_FAB_POS_KEY, JSON.stringify(p));
-    } catch {
-      /* ignore */
-    }
-  }
-  return p;
-}
-
-function initLogFabPosition() {
-  const fab = $("#log-fab");
-  if (!fab) return;
-  try {
-    const raw = localStorage.getItem(LOG_FAB_POS_KEY);
-    if (raw) {
-      const p = JSON.parse(raw);
-      if (Number.isFinite(p.x) && Number.isFinite(p.y)) {
-        applyLogFabPosition(p.x, p.y, fab);
-        return;
-      }
-    }
-  } catch {
-    /* ignore */
-  }
-  fab.style.left = "12px";
-  fab.style.bottom = "12px";
-  fab.style.top = "auto";
-  fab.style.right = "auto";
-}
-
-function bindLogFabDrag() {
-  const fab = $("#log-fab");
-  if (!fab) return;
-  initLogFabPosition();
-
-  let drag = null;
-
-  fab.addEventListener("pointerdown", (e) => {
-    if (e.button !== 0) return;
-    const rect = fab.getBoundingClientRect();
-    fab.style.left = `${rect.left}px`;
-    fab.style.top = `${rect.top}px`;
-    fab.style.right = "auto";
-    fab.style.bottom = "auto";
-    drag = {
-      pointerId: e.pointerId,
-      startX: e.clientX,
-      startY: e.clientY,
-      origX: rect.left,
-      origY: rect.top,
-      moved: false,
-    };
-    fab.setPointerCapture(e.pointerId);
-    e.preventDefault();
-  });
-
-  fab.addEventListener("pointermove", (e) => {
-    if (!drag || e.pointerId !== drag.pointerId) return;
-    const dx = e.clientX - drag.startX;
-    const dy = e.clientY - drag.startY;
-    if (!drag.moved && Math.abs(dx) + Math.abs(dy) < LOG_FAB_DRAG_THRESHOLD) return;
-    drag.moved = true;
-    fab.classList.add("is-dragging");
-    applyLogFabPosition(drag.origX + dx, drag.origY + dy, fab, false);
-  });
-
-  const endDrag = (e) => {
-    if (!drag || e.pointerId !== drag.pointerId) return;
-    const wasDrag = drag.moved;
-    drag = null;
-    fab.classList.remove("is-dragging");
-    try {
-      fab.releasePointerCapture(e.pointerId);
-    } catch {
-      /* ignore */
-    }
-    if (wasDrag) {
-      const x = parseInt(fab.style.left, 10);
-      const y = parseInt(fab.style.top, 10);
-      if (Number.isFinite(x) && Number.isFinite(y)) applyLogFabPosition(x, y, fab, true);
-    } else {
-      toggleLogDrawer();
-    }
-  };
-
-  fab.addEventListener("pointerup", endDrag);
-  fab.addEventListener("pointercancel", endDrag);
-
-  fab.addEventListener(
-    "click",
-    (e) => {
-      e.preventDefault();
-    },
-    true,
-  );
-
-  window.addEventListener("resize", () => {
-    const x = parseInt(fab.style.left, 10);
-    const y = parseInt(fab.style.top, 10);
-    if (Number.isFinite(x) && Number.isFinite(y)) applyLogFabPosition(x, y, fab);
-  });
-}
-
-function logEntryTime(entry) {
-  return entry?.ts ?? entry?.time ?? "—";
-}
-
-function logEntryText(entry) {
-  return entry?.msg ?? entry?.message ?? "";
-}
-
-function formatLogLine(entry) {
-  return `[${logEntryTime(entry)}] [${entry?.kind ?? "?"}] ${logEntryText(entry)}`;
-}
-
-function appendLog(entry) {
-  const tab = state.logFilter;
-  if (tab !== "全部" && entry.kind !== tab) return;
-  const pre = $("#log-body");
-  if (!pre) return;
-  pre.textContent += `${formatLogLine(entry)}\n`;
-  if (pre.textContent.length > 120000) {
-    pre.textContent = pre.textContent.slice(-80000);
-  }
-  pre.scrollTop = pre.scrollHeight;
-}
-
-function connectLogs() {
-  if (state.logEs) state.logEs.close();
-  const pre = $("#log-body");
-  if (pre) pre.textContent = "";
-  state.logEs = new EventSource("/api/logs/stream");
-  state.logEs.onmessage = (ev) => {
-    try {
-      appendLog(JSON.parse(ev.data));
-    } catch {
-      /* ignore */
-    }
-  };
-  state.logEs.onerror = () => {
-    state.logEs?.close();
-    setTimeout(connectLogs, 3000);
-  };
-}
-
-async function reloadLogsHistory() {
-  const data = await API.get(`/api/logs?tab=${encodeURIComponent(state.logFilter)}`);
-  const pre = $("#log-body");
-  if (!pre) return;
-  pre.textContent = (data.entries || []).map(formatLogLine).join("\n");
-  pre.scrollTop = pre.scrollHeight;
 }
 
 // ── 保存操作 ─────────────────────────────────────────────
@@ -2946,6 +2959,11 @@ async function saveCategory(e) {
   const submitBtn = e?.submitter || e?.target?.querySelector('[type="submit"]');
   await withBtnBusy(submitBtn, async () => {
     const form = $("#form-category");
+    const pathErr = await validatePathFields(form);
+    if (pathErr) {
+      toast(pathErr, { variant: "error" });
+      return;
+    }
     const body = {
       source: form.source.value.trim(),
       inbox: form.inbox.value.trim(),
@@ -3027,6 +3045,11 @@ async function saveSettings(e) {
   const submitBtn = e?.submitter || e?.target?.querySelector('[type="submit"]');
   await withBtnBusy(submitBtn, async () => {
     const form = $("#form-settings");
+    const pathErr = await validatePathFields(form);
+    if (pathErr) {
+      toast(pathErr, { variant: "error" });
+      return;
+    }
     const body = {};
     for (const el of form.elements) {
       if (!el.name || el.type === "submit") continue;
@@ -3048,8 +3071,9 @@ async function saveSettings(e) {
   });
 }
 
-async function refreshUiAfterAi(applied) {
-  if (!applied?.length) return;
+async function refreshUiAfterAi(applied, assetId = state.assetId) {
+  if (!applied?.length || !assetId) return;
+  if (state.assetId !== assetId) return;
   state.assetFull = null;
   const categoryChanged = applied.includes("category");
   const catSettingsChanged = applied.some((k) => k.startsWith("cat."));
@@ -3084,23 +3108,38 @@ async function refreshUiAfterAi(applied) {
   ]);
 
   if (categoryChanged) {
-    const fresh = await API.get(`/api/assets/${state.assetId}`);
+    const fresh = await API.get(`/api/assets/${assetId}`);
+    if (state.assetId !== assetId) return;
     await bootstrap(false);
     await selectCategory(fresh.category);
-    await selectAsset(state.assetId);
+    if (state.assetId !== assetId) return;
+    await selectAsset(assetId);
+    return;
   } else {
     if (applied.some((k) => basicFields.has(k))) await loadBasicForm();
-    if (applied.some((k) => promptFields.has(k))) {
+    if (state.assetId !== assetId) return;
+    if (applied.some((k) => k === "cloud_prompt" || k === "cloud_negative")) {
+      state.assetFull = null;
+      const fresh = await API.get(`/api/assets/${assetId}`);
+      if (state.assetId !== assetId) return;
+      state.assetFull = fresh;
+      const genTab = effectiveGenTabId(fresh);
+      if (genTab?.startsWith("cloud-")) switchTab(genTab);
+      await loadCloudTab();
+    } else if (applied.some((k) => promptFields.has(k))) {
       if (assetUsesCloudBackend()) await loadCloudTab();
       else await loadComfyUiTab();
     }
+    if (state.assetId !== assetId) return;
     if (catSettingsChanged) {
-      const fresh = await API.get(`/api/assets/${state.assetId}`);
+      const fresh = await API.get(`/api/assets/${assetId}`);
+      if (state.assetId !== assetId) return;
       if (state.categoryId === fresh.category) await loadCategoryForm();
     }
     if (applied.includes("filename")) await loadAssetList();
     else if (applied.some((k) => basicFields.has(k))) await loadAssetList();
   }
+  if (state.assetId !== assetId) return;
   await loadPreview();
   await scanStatus();
   toast(t("toast.aiAutoSaved", { fields: applied.join(", ") }));
@@ -3111,33 +3150,55 @@ async function sendAi() {
     toast(t("toast.selectAsset"));
     return;
   }
-  if (state.aiBusy) return;
+  const assetId = state.assetId;
+  const mode = state.aiMode;
+  if (isAssetAiBusy(assetId)) return;
   const msg = $("#ai-input").value.trim();
   if (!msg) return;
   $("#ai-input").value = "";
-  setAiBusy(true);
+  beginAiRequest(assetId);
   try {
     const data = await API.post("/api/ai/chat", {
-      asset_id: state.assetId,
+      asset_id: assetId,
       message: msg,
-      mode: state.aiMode,
+      mode,
     });
-    await refreshAiMessages();
-    if (data.applied?.length) {
-      await refreshUiAfterAi(data.applied);
-    } else if (data.saved === false) {
-      toast(t("toast.aiReplyOnly"));
+    const stillViewing = assetId === state.assetId && mode === state.aiMode;
+    if (stillViewing) {
+      await refreshAiMessages();
+      if (data.applied?.length) {
+        await refreshUiAfterAi(data.applied, assetId);
+      } else {
+        const u = data.updates || {};
+        const hasPromptIntent =
+          u.cloud_prompt != null ||
+          u.cloud_negative != null ||
+          u.positive != null ||
+          u.negative != null ||
+          u.positive_prefix != null ||
+          u.positive_subject != null ||
+          u.positive_scene != null ||
+          u.positive_light != null;
+        if (hasPromptIntent) {
+          toast(t("toast.aiPromptNotApplied"));
+        } else {
+          toast(t("toast.aiReplyOnly"));
+        }
+      }
     }
   } catch (err) {
-    toast(err.message);
-    await refreshAiMessages();
-    const hasFailed = (state.aiChatHistory || []).some(
-      (item) => item.failed && item.retry_message === msg,
-    );
-    if (!hasFailed) appendFailedAiTurn(msg, err.message);
+    const stillViewing = assetId === state.assetId && mode === state.aiMode;
+    if (stillViewing) {
+      toast(err.message);
+      await refreshAiMessages();
+      const hasFailed = (state.aiChatHistory || []).some(
+        (item) => item.failed && item.retry_message === msg,
+      );
+      if (!hasFailed) appendFailedAiTurn(msg, err.message);
+    }
   } finally {
-    setAiBusy(false);
-    updateAiModeUi();
+    endAiRequest(assetId);
+    if (assetId === state.assetId) updateAiModeUi();
   }
 }
 
@@ -3232,6 +3293,10 @@ async function launchPostprocessWindow(assetId, subject) {
   const returnUrl = `/?asset=${encodeURIComponent(assetId)}`;
   try {
     sessionStorage.setItem("artApp.ppReturn", returnUrl);
+    sessionStorage.setItem(
+      "artApp.ppSkipCanvasSync",
+      JSON.stringify({ assetId, subject }),
+    );
   } catch {
     /* ignore */
   }
@@ -3359,6 +3424,7 @@ async function deleteAsset(assetId) {
   if (!ok) return;
   try {
     await API.del(`/api/assets/${assetId}`);
+    state.selectedAssetIds = state.selectedAssetIds.filter((id) => id !== assetId);
     if (state.assetId === assetId) {
       state.assetId = null;
       state.assetFull = null;
@@ -3372,13 +3438,281 @@ async function deleteAsset(assetId) {
   }
 }
 
-async function refreshAssetEntry(assetId) {
-  await selectAsset(assetId);
-  await scanStatus();
-  await loadPreview();
+async function deleteAssets(assetIds) {
+  const ids = [...new Set((assetIds || []).filter(Boolean))];
+  if (!ids.length) return;
+  if (ids.length === 1) {
+    await deleteAsset(ids[0]);
+    return;
+  }
+  const ok = await showConfirmDialog({
+    title: t("confirm.deleteAssets.title"),
+    message: t("confirm.deleteAssets.message", { n: ids.length }),
+    details: [t("confirm.deleteAssets.detailConfig"), t("confirm.deleteAssets.detailFiles")],
+    confirmText: t("confirm.deleteAssets.confirm"),
+    danger: true,
+  });
+  if (!ok) return;
+  showGlobalOverlay(t("toast.deleteAssetsWorking", { cur: 0, total: ids.length }));
+  let deleted = 0;
+  let errors = 0;
+  try {
+    for (let i = 0; i < ids.length; i++) {
+      const id = ids[i];
+      showGlobalOverlay(t("toast.deleteAssetsWorking", { cur: i + 1, total: ids.length }));
+      try {
+        await API.del(`/api/assets/${id}`);
+        deleted++;
+        state.selectedAssetIds = state.selectedAssetIds.filter((sid) => sid !== id);
+        if (state.assetId === id) {
+          state.assetId = null;
+          state.assetFull = null;
+          clearPreview();
+        }
+      } catch {
+        errors++;
+      }
+    }
+  } finally {
+    hideGlobalOverlay();
+  }
+  await loadAssetList();
+  updateMainTabsVisibility();
+  if (!categoryHasAssets()) switchTab("category");
+  if (errors) toast(t("toast.batchPartialFail", { errors, total: ids.length }), { variant: "error" });
+  else if (deleted) toast(t("toast.deleteAssetsDone", { n: deleted }));
 }
 
-let assetCtxId = null;
+async function refreshAssetEntry(assetId, { bustCache = true } = {}) {
+  await selectAsset(assetId);
+  await scanStatus();
+  await loadPreview({ bustCache });
+}
+
+async function refreshAssetEntries(assetIds, { bustCache = true } = {}) {
+  const ids = [...new Set((assetIds || []).filter(Boolean))];
+  if (!ids.length) return;
+  if (ids.length === 1) {
+    await refreshAssetEntry(ids[0], { bustCache });
+    return;
+  }
+  showGlobalOverlay(t("toast.refreshWorking"));
+  try {
+    await loadAssetList();
+    await scanStatus();
+    if (state.assetId && ids.includes(state.assetId)) {
+      await loadPreview({ bustCache });
+      await loadPreviewInfo(state.assetId);
+    }
+  } finally {
+    hideGlobalOverlay();
+  }
+}
+
+async function switchPreviewToInboxIfCurrent(assetIds) {
+  if (!state.assetId || !assetIds.includes(state.assetId)) return;
+  const keepSelection = [...state.selectedAssetIds];
+  state.previewSource = "inbox";
+  $$(".preview-side .seg-btn").forEach((btn) => {
+    btn.classList.toggle("active", (btn.dataset.source || "inbox") === "inbox");
+  });
+  await loadAssetList();
+  await scanStatus();
+  await loadPreview({ bustCache: true });
+  await loadPreviewInfo(state.assetId);
+  state.selectedAssetIds = keepSelection.filter((id) => state.assets.some((a) => a.id === id));
+  renderAssets();
+}
+
+async function removeMagentaFromAssets(assetIds) {
+  const ids = [...new Set((assetIds || []).filter(Boolean))];
+  if (!ids.length) return;
+  const total = ids.length;
+  showGlobalOverlay(t("toast.removeMagentaWorking", { cur: 1, total }));
+  let changed = 0;
+  let skipped = 0;
+  let errors = 0;
+  try {
+    for (let i = 0; i < ids.length; i++) {
+      const id = ids[i];
+      showGlobalOverlay(t("toast.removeMagentaWorking", { cur: i + 1, total }));
+      try {
+        const r = await API.post(`/api/assets/${encodeURIComponent(id)}/remove-magenta`);
+        if (r.changed) changed++;
+        else skipped++;
+      } catch {
+        errors++;
+      }
+    }
+  } finally {
+    hideGlobalOverlay();
+  }
+  if (changed) {
+    if (ids.includes(state.assetId)) {
+      await switchPreviewToInboxIfCurrent(ids);
+    } else {
+      await loadAssetList();
+      await scanStatus();
+    }
+  } else if (!errors) {
+    await loadAssetList();
+  }
+  if (errors) {
+    toast(t("toast.batchPartialFail", { errors, total }), { variant: "error" });
+  } else if (changed) {
+    toast(
+      total > 1
+        ? t("toast.batchRemoveMagentaDone", { changed, skipped })
+        : t("toast.removeMagentaDone"),
+    );
+  } else {
+    toast(t("toast.removeMagentaNoChange"));
+  }
+}
+
+async function removeMagentaFromAsset(assetId) {
+  await removeMagentaFromAssets([assetId]);
+}
+
+async function autoTrimInboxAssets(assetIds) {
+  const ids = [...new Set((assetIds || []).filter(Boolean))];
+  if (!ids.length) return;
+  const total = ids.length;
+  showGlobalOverlay(t("toast.autoTrimWorking", { cur: 1, total }));
+  let changed = 0;
+  let skipped = 0;
+  let errors = 0;
+  let lastResult = null;
+  try {
+    for (let i = 0; i < ids.length; i++) {
+      const id = ids[i];
+      showGlobalOverlay(t("toast.autoTrimWorking", { cur: i + 1, total }));
+      try {
+        const r = await API.post(`/api/assets/${encodeURIComponent(id)}/auto-trim-inbox`);
+        lastResult = r;
+        if (r.unchanged) skipped++;
+        else changed++;
+      } catch {
+        errors++;
+      }
+    }
+  } finally {
+    hideGlobalOverlay();
+  }
+  if (changed) {
+    if (ids.includes(state.assetId)) {
+      await switchPreviewToInboxIfCurrent(ids);
+    } else {
+      await loadAssetList();
+      await scanStatus();
+    }
+  } else if (!errors) {
+    await loadAssetList();
+  }
+  if (errors) {
+    toast(t("toast.batchPartialFail", { errors, total }), { variant: "error" });
+  } else if (changed) {
+    if (total > 1) {
+      toast(t("toast.batchAutoTrimDone", { changed, skipped }));
+    } else if (lastResult) {
+      const r = lastResult;
+      const canvas = r.canvas;
+      if (canvas?.changed) {
+        toast(
+          t("toast.autoTrimDoneWithCanvas", {
+            w: r.width,
+            h: r.height,
+            ow: r.old_width,
+            oh: r.old_height,
+            cw: canvas.canvas_width,
+            ch: canvas.canvas_height,
+            ocw: canvas.old_canvas_width,
+            och: canvas.old_canvas_height,
+          }),
+        );
+      } else {
+        toast(
+          t("toast.autoTrimDone", {
+            w: r.width,
+            h: r.height,
+            ow: r.old_width,
+            oh: r.old_height,
+          }),
+        );
+      }
+    }
+  } else {
+    toast(t("toast.autoTrimNoChange"));
+  }
+}
+
+async function autoTrimInboxAsset(assetId) {
+  await autoTrimInboxAssets([assetId]);
+}
+
+let assetCtxIds = [];
+
+const ASSET_CTX_SINGLE_ONLY = new Set([
+  "rename",
+  "duplicate",
+  "postprocess",
+  "open-source",
+  "open-inbox",
+  "open-unity",
+]);
+
+const ASSET_CTX_LABEL_KEYS = {
+  "gen-one": ["ctx.genOne", "ctx.genMany"],
+  "gen-one-export": ["ctx.genOneExport", "ctx.genManyExport"],
+  "export-one": ["ctx.exportOne", "ctx.exportMany"],
+  "remove-magenta": ["ctx.removeMagenta", "ctx.removeMagentaMany"],
+  "auto-trim": ["ctx.autoTrim", "ctx.autoTrimMany"],
+  refresh: ["ctx.refresh", "ctx.refreshMany"],
+  delete: ["ctx.delete", "ctx.deleteMany"],
+};
+
+function updateAssetCtxMenu(ids) {
+  const menu = $("#asset-ctx-menu");
+  if (!menu) return;
+  const n = ids.length;
+  const multi = n > 1;
+  for (const [act, [singleKey, multiKey]] of Object.entries(ASSET_CTX_LABEL_KEYS)) {
+    const btn = menu.querySelector(`[data-ctx="${act}"]`);
+    if (!btn) continue;
+    btn.textContent = multi ? t(multiKey, { n }) : t(singleKey);
+  }
+  menu.querySelectorAll("[data-ctx]").forEach((btn) => {
+    const act = btn.dataset.ctx;
+    const disabled = multi && ASSET_CTX_SINGLE_ONLY.has(act);
+    btn.disabled = disabled;
+    btn.classList.toggle("is-disabled", disabled);
+    btn.setAttribute("aria-disabled", disabled ? "true" : "false");
+  });
+}
+
+function showAssetCtxMenu(x, y, assetId) {
+  closeNavMenus();
+  hideCatCtxMenu();
+  const menu = $("#asset-ctx-menu");
+  if (!menu) return;
+  if (!isAssetRowSelected(assetId)) {
+    state.selectedAssetIds = [assetId];
+    state.lastAssetClickId = assetId;
+    renderAssets();
+  }
+  assetCtxIds = effectiveSelectedIds();
+  updateAssetCtxMenu(assetCtxIds);
+  openFloatingMenu(menu, () => {
+    menu.style.left = "0px";
+    menu.style.top = "0px";
+    const pad = 8;
+    const rect = menu.getBoundingClientRect();
+    const maxX = window.innerWidth - rect.width - pad;
+    const maxY = window.innerHeight - rect.height - pad;
+    menu.style.left = `${Math.max(pad, Math.min(x, maxX))}px`;
+    menu.style.top = `${Math.max(pad, Math.min(y, maxY))}px`;
+  });
+}
 
 const assetDrag = {
   active: false,
@@ -3783,11 +4117,14 @@ function bindCategoryContextMenu() {
     hideCatCtxMenu();
     const act = btn.dataset.ctx;
     if (act === "gen-category") {
-      await runGenerate(await enabledAssetIdsForCategory(id));
+      const { ids, assets } = await enabledAssetsForCategory(id);
+      await runGenerate(ids, { assetRows: assets });
     } else if (act === "gen-category-export") {
-      await runGenerate(await enabledAssetIdsForCategory(id), { exportAfter: true });
+      const { ids, assets } = await enabledAssetsForCategory(id);
+      await runGenerate(ids, { exportAfter: true, assetRows: assets });
     } else if (act === "export-category") {
-      await runExport(await enabledAssetIdsForCategory(id));
+      const { ids } = await enabledAssetsForCategory(id);
+      await runExport(ids);
     } else if (act === "rename") await renameCategoryDialog(id);
     else if (act === "delete") await deleteCategory(id);
   });
@@ -3814,26 +4151,8 @@ async function duplicateAsset(assetId) {
 }
 
 function hideAssetCtxMenu() {
-  assetCtxId = null;
+  assetCtxIds = [];
   closeFloatingMenu($("#asset-ctx-menu"));
-}
-
-function showAssetCtxMenu(x, y, assetId) {
-  closeNavMenus();
-  hideCatCtxMenu();
-  const menu = $("#asset-ctx-menu");
-  if (!menu) return;
-  assetCtxId = assetId;
-  openFloatingMenu(menu, () => {
-    menu.style.left = "0px";
-    menu.style.top = "0px";
-    const pad = 8;
-    const rect = menu.getBoundingClientRect();
-    const maxX = window.innerWidth - rect.width - pad;
-    const maxY = window.innerHeight - rect.height - pad;
-    menu.style.left = `${Math.max(pad, Math.min(x, maxX))}px`;
-    menu.style.top = `${Math.max(pad, Math.min(y, maxY))}px`;
-  });
 }
 
 function bindAssetContextMenu() {
@@ -3853,28 +4172,32 @@ function bindAssetContextMenu() {
 
   menu.addEventListener("click", async (e) => {
     const btn = e.target.closest("[data-ctx]");
-    if (!btn || !assetCtxId) return;
+    if (!btn || btn.disabled || btn.classList.contains("is-disabled")) return;
+    const ids = assetCtxIds.length ? [...assetCtxIds] : [];
+    if (!ids.length) return;
     e.stopPropagation();
-    const id = assetCtxId;
     hideAssetCtxMenu();
     const act = btn.dataset.ctx;
+    const focusId = ids.includes(state.assetId) ? state.assetId : ids[0];
     if (act === "gen-one") {
-      if (id !== state.assetId) await selectAsset(id);
-      await runGenerate([id], { emptyToastKey: "toast.selectAsset" });
+      if (focusId !== state.assetId) await selectAsset(focusId);
+      await runGenerate(ids, { emptyToastKey: "toast.selectAsset" });
     } else if (act === "gen-one-export") {
-      if (id !== state.assetId) await selectAsset(id);
-      await runGenerate([id], { exportAfter: true, emptyToastKey: "toast.selectAsset" });
+      if (focusId !== state.assetId) await selectAsset(focusId);
+      await runGenerate(ids, { exportAfter: true, emptyToastKey: "toast.selectAsset" });
     } else if (act === "export-one") {
-      if (id !== state.assetId) await selectAsset(id);
-      await runExport([id], { emptyToastKey: "toast.selectAsset" });
-    } else if (act === "rename") await renameAssetDialog(id);
-    else if (act === "duplicate") await duplicateAsset(id).catch((err) => err && toast(err.message));
-    else if (act === "postprocess") await openPostprocess(id);
-    else if (act === "open-source") await openAssetFile(id, "source");
-    else if (act === "open-inbox") await openAssetFile(id, "inbox");
-    else if (act === "open-unity") await openAssetFile(id, "unity");
-    else if (act === "refresh") await refreshAssetEntry(id);
-    else if (act === "delete") await deleteAsset(id);
+      if (focusId !== state.assetId) await selectAsset(focusId);
+      await runExport(ids, { emptyToastKey: "toast.selectAsset" });
+    } else if (act === "rename") await renameAssetDialog(ids[0]);
+    else if (act === "duplicate") await duplicateAsset(ids[0]).catch((err) => err && toast(err.message));
+    else if (act === "postprocess") await openPostprocess(ids[0]);
+    else if (act === "remove-magenta") await removeMagentaFromAssets(ids);
+    else if (act === "auto-trim") await autoTrimInboxAssets(ids);
+    else if (act === "open-source") await openAssetFile(ids[0], "source");
+    else if (act === "open-inbox") await openAssetFile(ids[0], "inbox");
+    else if (act === "open-unity") await openAssetFile(ids[0], "unity");
+    else if (act === "refresh") await refreshAssetEntries(ids);
+    else if (act === "delete") await deleteAssets(ids);
   });
 
   document.addEventListener("click", (e) => {
@@ -4438,7 +4761,6 @@ function bindUi() {
   bindCategoryContextMenu();
   bindAssetDragToCategory();
   bindJobFloat();
-  bindLogFabDrag();
   bindPreviewViewport();
   bindDialogDismiss($("#dlg-new-cat"));
   bindDialogDismiss($("#dlg-new-asset"));
@@ -4447,6 +4769,8 @@ function bindUi() {
   bindDialogDismiss($("#dlg-confirm"));
   bindDialogDismiss($("#dlg-pp-subject"));
   bindWelcomeDialog();
+  initPathFields(document);
+  bindPathFieldSideEffects();
 
   $("#preview-img")?.addEventListener("error", () => {
     const asset = state.assets.find((a) => a.id === state.assetId);
@@ -4525,15 +4849,7 @@ function bindUi() {
     void saveGenModeOnly();
   });
 
-  $("#log-filter")?.addEventListener("change", (e) => {
-    state.logFilter = e.target.value;
-    reloadLogsHistory();
-  });
-
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && $("#log-drawer")?.classList.contains("open")) {
-      closeLogDrawer();
-    }
     if (e.key === "Escape") closeNavMenus();
   });
 
@@ -4618,12 +4934,6 @@ function bindUi() {
         break;
       case "save-prompts":
         await savePrompts(btn);
-        break;
-      case "pick-ref-image":
-        await pickRefImage(btn);
-        break;
-      case "pick-cloud-ref-image":
-        await pickCloudRefImage(btn);
         break;
       case "save-cloud-prompts":
         await saveCloudPrompts(btn);
@@ -4770,6 +5080,7 @@ async function bootstrap(pickFirst = true) {
       applyDomI18n();
       bindLangSwitcher();
       onLangChange(() => refreshI18nUi());
+      initLogPanel();
     } catch (err) {
       console.error("i18n init failed", err);
     }
@@ -4816,5 +5127,4 @@ async function bootstrap(pickFirst = true) {
 
 document.body.classList.add("is-booting");
 bindUi();
-connectLogs();
 bootstrap();
