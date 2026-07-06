@@ -261,6 +261,10 @@ function categoryAssetIds() {
   return state.assets.filter((a) => a.enabled !== false).map((a) => a.id);
 }
 
+function categoryExportAssetIds() {
+  return state.assets.map((a) => a.id);
+}
+
 async function enabledAssetsForCategory(catId) {
   if (catId === state.categoryId) {
     const assets = state.assets.filter((a) => a.enabled !== false);
@@ -268,6 +272,15 @@ async function enabledAssetsForCategory(catId) {
   }
   const data = await API.get(`/api/assets?category=${encodeURIComponent(catId)}`);
   const assets = (data.assets || []).filter((a) => a.enabled !== false);
+  return { ids: assets.map((a) => a.id), assets };
+}
+
+async function allAssetsForCategory(catId) {
+  if (catId === state.categoryId) {
+    return { ids: state.assets.map((a) => a.id), assets: state.assets };
+  }
+  const data = await API.get(`/api/assets?category=${encodeURIComponent(catId)}`);
+  const assets = data.assets || [];
   return { ids: assets.map((a) => a.id), assets };
 }
 
@@ -804,6 +817,83 @@ async function loadBasicForm(loadSeq = assetLoadSeq) {
   updateGenerationTabsVisibility();
 }
 
+let categoryFormBaseline = null;
+
+function readCategoryFormValues() {
+  const form = $("#form-category");
+  if (!form) return null;
+  return {
+    source: form.source.value.trim(),
+    inbox: form.inbox.value.trim(),
+    unity: form.unity.value.trim(),
+    checkpoint: $("#cat-ckpt")?.value || "",
+    alpha_matte: !!form.alpha_matte.checked,
+    positive_common: form.positive_common.value,
+    negative_common: form.negative_common.value,
+  };
+}
+
+function captureCategoryFormBaseline() {
+  if (!state.categoryId) {
+    categoryFormBaseline = null;
+    return;
+  }
+  const values = readCategoryFormValues();
+  if (!values) {
+    categoryFormBaseline = null;
+    return;
+  }
+  categoryFormBaseline = { catId: state.categoryId, ...values };
+}
+
+function isCategoryFormDirty() {
+  if (!state.categoryId || !categoryFormBaseline) return false;
+  if (categoryFormBaseline.catId !== state.categoryId) return false;
+  const current = readCategoryFormValues();
+  if (!current) return false;
+  return Object.keys(current).some((key) => current[key] !== categoryFormBaseline[key]);
+}
+
+function buildCategoryFormBody() {
+  const form = $("#form-category");
+  if (!form) return null;
+  return {
+    source: form.source.value.trim(),
+    inbox: form.inbox.value.trim(),
+    unity: form.unity.value.trim(),
+    checkpoint: $("#cat-ckpt")?.value || "",
+    alpha_matte: form.alpha_matte.checked ? "default" : "none",
+    positive_common: form.positive_common.value,
+    negative_common: form.negative_common.value,
+  };
+}
+
+async function persistCategoryFormIfDirty(catId = state.categoryId, { silent = false } = {}) {
+  if (!catId || catId !== state.categoryId) return true;
+  if (!isCategoryFormDirty()) return true;
+  const form = $("#form-category");
+  if (!form) return true;
+  const pathErr = await validatePathFields(form);
+  if (pathErr) {
+    toast(pathErr, { variant: "error" });
+    return false;
+  }
+  const body = buildCategoryFormBody();
+  if (!body) return false;
+  try {
+    await API.put(`/api/categories/${catId}`, body);
+    captureCategoryFormBaseline();
+    const data = await API.get("/api/categories");
+    state.categories = data.categories || [];
+    renderCategories();
+    if (!silent) toast(t("toast.categoryAutoSaved"));
+    return true;
+  } catch (err) {
+    toast(err.message, { variant: "error" });
+    return false;
+  }
+}
+
 async function loadCategoryForm() {
   if (!state.categoryId) return;
   const data = await API.get(`/api/categories/${state.categoryId}`);
@@ -817,6 +907,7 @@ async function loadCategoryForm() {
   form.negative_common.value = data.negative_common || "";
   rebuildCheckpointSelect($("#cat-ckpt"), t("form.checkpointUnset"), data.checkpoint || "");
   initPathFields(form);
+  captureCategoryFormBaseline();
 }
 
 function bindPathFieldSideEffects() {
@@ -2913,7 +3004,7 @@ async function startGenerate(exportAfter = false, onlySelected = false) {
 }
 
 async function startExport(onlySelected = false) {
-  const ids = onlySelected ? selectedIds() : categoryAssetIds();
+  const ids = onlySelected ? selectedIds() : categoryExportAssetIds();
   await runExport(ids, {
     emptyToastKey: onlySelected ? "toast.selectAsset" : "toast.noCategoryAssets",
   });
@@ -2964,16 +3055,10 @@ async function saveCategory(e) {
       toast(pathErr, { variant: "error" });
       return;
     }
-    const body = {
-      source: form.source.value.trim(),
-      inbox: form.inbox.value.trim(),
-      unity: form.unity.value.trim(),
-      checkpoint: $("#cat-ckpt")?.value || "",
-      alpha_matte: form.alpha_matte.checked ? "default" : "none",
-      positive_common: form.positive_common.value,
-      negative_common: form.negative_common.value,
-    };
+    const body = buildCategoryFormBody();
+    if (!body) return;
     await API.put(`/api/categories/${state.categoryId}`, body);
+    captureCategoryFormBaseline();
     toast(t("toast.categorySaved"));
     const data = await API.get("/api/categories");
     state.categories = data.categories || [];
@@ -3933,10 +4018,107 @@ function bindAssetDragToCategory() {
 }
 
 function closeNavMenus() {
-  closeAllFloatingMenus(["#asset-ctx-menu", "#cat-ctx-menu"]);
+  closeAllFloatingMenus(["#asset-ctx-menu", "#cat-ctx-menu", ".nav-dropdown"]);
+}
+
+function positionNavDropdown(trigger, menu) {
+  const r = trigger.getBoundingClientRect();
+  menu.style.left = `${Math.max(8, r.left)}px`;
+  menu.style.top = `${r.bottom + 6}px`;
+}
+
+function toggleNavDropdown(trigger, menu) {
+  const open = menu.classList.contains("fx-open");
+  closeNavMenus();
+  if (open) return;
+  trigger.setAttribute("aria-expanded", "true");
+  openFloatingMenu(menu, () => positionNavDropdown(trigger, menu));
+}
+
+function bindToolbarNav() {
+  const pairs = [
+    ["#nav-generate-trigger", "#nav-generate-menu"],
+    ["#nav-export-trigger", "#nav-export-menu"],
+    ["#nav-config-trigger", "#nav-config-menu"],
+  ];
+  for (const [trigSel, menuSel] of pairs) {
+    const trigger = $(trigSel);
+    const menu = $(menuSel);
+    if (!trigger || !menu) continue;
+    trigger.addEventListener("click", (e) => {
+      e.stopPropagation();
+      toggleNavDropdown(trigger, menu);
+    });
+  }
+
+  document.getElementById("app")?.addEventListener("click", async (e) => {
+    const btn = e.target.closest("[data-pipeline]");
+    if (!btn) return;
+    closeNavMenus();
+    const act = btn.dataset.pipeline;
+    switch (act) {
+      case "gen-selected":
+        await startGenerate(false, true);
+        break;
+      case "gen-category":
+        if (!state.categoryId) {
+          toast(t("toast.selectCategory"), { variant: "error" });
+          return;
+        }
+        await runCategoryGenerate(state.categoryId);
+        break;
+      case "gen-export":
+        if (!state.categoryId) {
+          toast(t("toast.selectCategory"), { variant: "error" });
+          return;
+        }
+        await runCategoryGenerateExport(state.categoryId);
+        break;
+      case "export-selected":
+        await startExport(true);
+        break;
+      case "export-category":
+        if (!state.categoryId) {
+          toast(t("toast.selectCategory"), { variant: "error" });
+          return;
+        }
+        await runCategoryExport(state.categoryId);
+        break;
+      case "save-config":
+        await withBtnBusy(btn, async () => {
+          await API.post("/api/config/save");
+          toast(t("toast.configSaved"));
+        }).catch((err) => {
+          if (err) toast(err.message);
+        });
+        break;
+      case "reload-config":
+        await withBtnBusy(btn, async () => {
+          await API.post("/api/config/reload");
+          await bootstrap(false);
+          toast(t("toast.configReloaded"));
+        }).catch((err) => {
+          if (err) toast(err.message);
+        });
+        break;
+      default:
+        break;
+    }
+  });
 }
 
 /** 现代化确认对话框；返回 true 表示用户确认 */
+const CONFIRM_ICON_SVGS = {
+  danger:
+    '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/></svg>',
+  warn:
+    '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/></svg>',
+  accent:
+    '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.5 4.5L18 9l-4.5 1.5L12 15l-1.5-4.5L6 9l4.5-1.5L12 3z"/><path d="M19 14l.75 2.25L22 17l-2.25.75L19 20l-.75-2.25L16 17l2.25-.75L19 14z"/></svg>',
+  export:
+    '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>',
+};
+
 function showConfirmDialog({
   title,
   message,
@@ -3944,9 +4126,11 @@ function showConfirmDialog({
   confirmText,
   cancelText,
   danger = true,
+  tone,
+  icon,
 }) {
   const dlg = $("#dlg-confirm");
-  const icon = $("#confirm-icon");
+  const iconEl = $("#confirm-icon");
   const titleEl = $("#confirm-title");
   const msgEl = $("#confirm-message");
   const listEl = $("#confirm-details");
@@ -3954,9 +4138,19 @@ function showConfirmDialog({
   const cancelBtn = $("#confirm-cancel");
   if (!dlg || !titleEl || !msgEl || !okBtn || !cancelBtn) return Promise.resolve(false);
 
+  const resolvedTone = tone || (danger ? "danger" : "accent");
+  const resolvedIcon = icon || resolvedTone;
+  dlg.classList.remove("is-accent", "is-warn", "is-export");
+  if (resolvedTone === "accent") dlg.classList.add("is-accent");
+  else if (resolvedTone === "warn") dlg.classList.add("is-warn");
+  else if (resolvedTone === "export") dlg.classList.add("is-export");
+
   titleEl.textContent = title || "";
   msgEl.textContent = message || "";
-  icon?.classList.toggle("danger", danger);
+  if (iconEl) {
+    iconEl.className = `confirm-icon ${resolvedIcon}`;
+    iconEl.innerHTML = CONFIRM_ICON_SVGS[resolvedIcon] || CONFIRM_ICON_SVGS.danger;
+  }
   okBtn.textContent = confirmText || t("dlg.confirm");
   okBtn.className = danger ? "btn danger" : "btn primary";
   cancelBtn.textContent = cancelText || t("dlg.cancel");
@@ -3985,6 +4179,102 @@ function showConfirmDialog({
     cancelBtn.addEventListener("click", onCancel);
     dlg.addEventListener("cancel", onCancel);
   });
+}
+
+async function getCategoryAssetCounts(catId) {
+  try {
+    const data = await API.get(`/api/assets?category=${encodeURIComponent(catId)}`);
+    const assets = data.assets || [];
+    return {
+      total: assets.length,
+      enabled: assets.filter((a) => a.enabled !== false).length,
+    };
+  } catch {
+    return { total: 0, enabled: 0 };
+  }
+}
+
+async function confirmCategoryOperation(catId, kind) {
+  const cat = state.categories.find((c) => c.id === catId);
+  if (!cat) return false;
+
+  const { total, enabled } = await getCategoryAssetCounts(catId);
+  const isExport = kind === "export-category";
+  const count = isExport ? total : enabled;
+
+  if (count === 0) {
+    toast(t("toast.noCategoryAssets"));
+    return false;
+  }
+
+  const name = cat.label || cat.id;
+  const details = [];
+  if (kind === "gen-category") {
+    details.push(t("confirm.genCategory.detailBatch"));
+    if (total > enabled) {
+      details.push(t("confirm.genCategory.detailSkipped", { n: total - enabled }));
+    }
+    return showConfirmDialog({
+      title: t("confirm.genCategory.title"),
+      message: t("confirm.genCategory.message", { name, n: count }),
+      details,
+      confirmText: t("confirm.genCategory.confirm"),
+      danger: false,
+      tone: "accent",
+      icon: "accent",
+    });
+  }
+  if (kind === "gen-category-export") {
+    details.push(t("confirm.genCategoryExport.detailExport"));
+    details.push(t("confirm.genCategoryExport.detailBatch"));
+    if (total > enabled) {
+      details.push(t("confirm.genCategoryExport.detailSkipped", { n: total - enabled }));
+    }
+    return showConfirmDialog({
+      title: t("confirm.genCategoryExport.title"),
+      message: t("confirm.genCategoryExport.message", { name, n: count }),
+      details,
+      confirmText: t("confirm.genCategoryExport.confirm"),
+      danger: false,
+      tone: "accent",
+      icon: "accent",
+    });
+  }
+  if (kind === "export-category") {
+    details.push(t("confirm.exportCategory.detailScope"));
+    details.push(t("confirm.exportCategory.detailBatch"));
+    return showConfirmDialog({
+      title: t("confirm.exportCategory.title"),
+      message: t("confirm.exportCategory.message", { name, n: count }),
+      details,
+      confirmText: t("confirm.exportCategory.confirm"),
+      danger: false,
+      tone: "export",
+      icon: "export",
+    });
+  }
+  return false;
+}
+
+async function runCategoryGenerate(catId) {
+  if (!(await confirmCategoryOperation(catId, "gen-category"))) return;
+  if (!(await persistCategoryFormIfDirty(catId))) return;
+  const { ids, assets } = await enabledAssetsForCategory(catId);
+  await runGenerate(ids, { assetRows: assets });
+}
+
+async function runCategoryGenerateExport(catId) {
+  if (!(await confirmCategoryOperation(catId, "gen-category-export"))) return;
+  if (!(await persistCategoryFormIfDirty(catId))) return;
+  const { ids, assets } = await enabledAssetsForCategory(catId);
+  await runGenerate(ids, { exportAfter: true, assetRows: assets });
+}
+
+async function runCategoryExport(catId) {
+  if (!(await confirmCategoryOperation(catId, "export-category"))) return;
+  if (!(await persistCategoryFormIfDirty(catId))) return;
+  const { ids } = await allAssetsForCategory(catId);
+  await runExport(ids);
 }
 
 async function renameCategoryDialog(catId) {
@@ -4041,6 +4331,8 @@ async function deleteCategory(catId) {
     details,
     confirmText: t("confirm.deleteCategory.confirm"),
     danger: true,
+    tone: "danger",
+    icon: "danger",
   });
   if (!ok) return;
   try {
@@ -4117,14 +4409,11 @@ function bindCategoryContextMenu() {
     hideCatCtxMenu();
     const act = btn.dataset.ctx;
     if (act === "gen-category") {
-      const { ids, assets } = await enabledAssetsForCategory(id);
-      await runGenerate(ids, { assetRows: assets });
+      await runCategoryGenerate(id);
     } else if (act === "gen-category-export") {
-      const { ids, assets } = await enabledAssetsForCategory(id);
-      await runGenerate(ids, { exportAfter: true, assetRows: assets });
+      await runCategoryGenerateExport(id);
     } else if (act === "export-category") {
-      const { ids } = await enabledAssetsForCategory(id);
-      await runExport(ids);
+      await runCategoryExport(id);
     } else if (act === "rename") await renameCategoryDialog(id);
     else if (act === "delete") await deleteCategory(id);
   });
@@ -4755,6 +5044,7 @@ function bindAssetPanelResize() {
 
 function bindUi() {
   bindRipple(document.getElementById("app"));
+  bindToolbarNav();
   bindPromptSegmentListeners();
   bindAssetPanelResize();
   bindAssetContextMenu();
@@ -5039,7 +5329,7 @@ function handlePostprocessApplied(data) {
       if (form?.width) form.width.value = data.width;
       if (form?.height) form.height.value = data.height;
     }
-    renderAssetList();
+    renderAssets();
   }
   if (data.assetId === state.assetId) {
     loadPreview();

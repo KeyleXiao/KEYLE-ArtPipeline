@@ -53,6 +53,8 @@ python run_dev.py
 - **in (inbox)**：绿 = 与 source 一致，黄 = 已后处理，红 = 缺失
 - **U (引擎)**：绿 = 与 inbox 一致，红 = 缺失或需重新导出
 
+![主工作台 — 分类 · 资源 · S·in·U 状态 · AI 助手 · ComfyUI / 云模型页签](images/main-workbench.png)
+
 ### 主界面操作
 
 | 操作 | 说明 |

@@ -3341,6 +3341,14 @@ dialog menu {
     0 0 0 1px rgba(255, 255, 255, 0.04) inset;
 }
 
+.confirm-dialog.is-accent {
+  border-color: rgba(99, 102, 241, 0.28);
+}
+
+.confirm-dialog.is-warn {
+  border-color: rgba(251, 191, 36, 0.28);
+}
+
 .confirm-dialog-inner {
   padding: 24px 24px 20px;
 }
@@ -3365,6 +3373,18 @@ dialog menu {
   background: rgba(251, 191, 36, 0.14);
   color: #fbbf24;
   box-shadow: 0 0 0 6px rgba(251, 191, 36, 0.08);
+}
+
+.confirm-icon.accent {
+  background: rgba(99, 102, 241, 0.14);
+  color: var(--accent);
+  box-shadow: 0 0 0 6px rgba(99, 102, 241, 0.08);
+}
+
+.confirm-icon.export {
+  background: rgba(34, 211, 238, 0.12);
+  color: var(--accent-2);
+  box-shadow: 0 0 0 6px rgba(34, 211, 238, 0.08);
 }
 
 .pp-subject-dialog {
@@ -3434,6 +3454,24 @@ dialog menu {
   font-weight: 700;
 }
 
+.confirm-dialog.is-accent .confirm-details {
+  background: rgba(99, 102, 241, 0.06);
+  border-color: rgba(99, 102, 241, 0.18);
+}
+
+.confirm-dialog.is-accent .confirm-details li::before {
+  color: var(--accent);
+}
+
+.confirm-dialog.is-export .confirm-details {
+  background: rgba(34, 211, 238, 0.06);
+  border-color: rgba(34, 211, 238, 0.18);
+}
+
+.confirm-dialog.is-export .confirm-details li::before {
+  color: var(--accent-2);
+}
+
 .confirm-actions {
   display: flex;
   gap: 8px;
@@ -3451,6 +3489,10 @@ dialog menu {
 
 .confirm-actions .btn.danger:hover {
   filter: brightness(1.06);
+}
+
+.confirm-actions .btn.primary {
+  box-shadow: 0 4px 14px var(--accent-glow);
 }
 
 .hint {
@@ -4788,9 +4830,23 @@ dialog menu {
 }
 
 .layer-item.active {
+  position: relative;
   background: rgba(99, 102, 241, 0.14);
   border-color: rgba(99, 102, 241, 0.42);
-  box-shadow: inset 3px 0 0 var(--accent);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  box-shadow: none;
+}
+
+.layer-item.active::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  background: var(--accent);
+  border-radius: 0;
+  pointer-events: none;
 }
 
 .layer-item.multi-selected {

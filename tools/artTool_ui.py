@@ -146,6 +146,7 @@ class ArtToolApp(BaseWindow):
         self.pipeline = PipelineCore(self.config_mgr)
         self._busy = False
         self._selected_category: str | None = None
+        self._cat_list_ids: list[str] = []
         self._selected_asset_id: str | None = None
         self._checkpoint_list: list[str] = []
         self._preview_images: dict[str, Any] = {}
@@ -1355,12 +1356,19 @@ class ArtToolApp(BaseWindow):
     def _parse_asset_seed_field(self) -> str | None:
         return self._parse_seed_text(self.fields["Seed"].get(), label="资源 Seed")
 
+    def _cat_id_from_list_index(self, idx: int) -> str | None:
+        if idx < 0 or idx >= len(self._cat_list_ids):
+            return None
+        return self._cat_list_ids[idx]
+
     def _refresh_categories(self) -> None:
         self.cat_list.delete(0, tk.END)
+        self._cat_list_ids = []
         cats = self.config_mgr.categories()
         for c in cats:
             ckpt_short = Path(c.checkpoint).name[:18] if c.checkpoint else "默认"
             self.cat_list.insert(tk.END, f"{c.label} ({c.id}) · {ckpt_short}")
+            self._cat_list_ids.append(c.id)
         cat_ids = [c.id for c in cats]
         self.fields["分类"]["values"] = cat_ids
         if cats and not self._selected_category:
@@ -1499,8 +1507,9 @@ class ArtToolApp(BaseWindow):
             idx = self.cat_list.nearest(evt.y)
             if idx < 0:
                 return
-            text = self.cat_list.get(idx)
-            cat_id = text.split("(")[1].split(")")[0]
+            cat_id = self._cat_id_from_list_index(idx)
+            if not cat_id:
+                return
             self._list_status_var.set(f"→ {cat_id}")
         except (tk.TclError, IndexError):
             pass
@@ -1509,8 +1518,9 @@ class ArtToolApp(BaseWindow):
         idx = self.cat_list.curselection()
         if not idx:
             return
-        text = self.cat_list.get(idx[0])
-        cat_id = text.split("(")[1].split(")")[0]
+        cat_id = self._cat_id_from_list_index(idx[0])
+        if not cat_id:
+            return
         if cat_id == self._selected_category:
             return
         self._selected_category = cat_id
@@ -2530,9 +2540,15 @@ class ArtToolApp(BaseWindow):
         cat = self.config_mgr.category_by_id(self._selected_category)
         if not cat:
             return
-        cat.source = self.fields["path_source"].get().strip()
-        cat.inbox = self.fields["path_inbox"].get().strip()
-        cat.unity = self.fields["path_unity"].get().strip()
+        cat.source = self.config_mgr.normalize_category_path(
+            self.fields["path_source"].get().strip(), under="art"
+        )
+        cat.inbox = self.config_mgr.normalize_category_path(
+            self.fields["path_inbox"].get().strip(), under="art"
+        )
+        cat.unity = self.config_mgr.normalize_category_path(
+            self.fields["path_unity"].get().strip(), under="project"
+        )
         cat.checkpoint = self.category_ckpt_combo.get().strip()
         cat.positive_common = self.category_positive_common_text.get("1.0", tk.END).strip()
         cat.negative_common = self.category_negative_common_text.get("1.0", tk.END).strip()
@@ -2547,6 +2563,14 @@ class ArtToolApp(BaseWindow):
         if asset and asset.remove_bg_mode == REMOVE_BG_INHERIT:
             self._refresh_preview()
         self._log(f"已保存分类设置: {cat.id} · ckpt={cat.checkpoint or '默认'}")
+
+    def _maybe_save_category_paths(self) -> None:
+        """分类路径表单已加载且用户可能未点保存时，批量操作前先写入配置。"""
+        if not self._selected_category:
+            return
+        if self._category_paths_loaded_for != self._selected_category:
+            return
+        self._save_category_paths()
 
     def _save_settings(self) -> None:
         d = self.config_mgr.defaults
@@ -2692,6 +2716,7 @@ class ArtToolApp(BaseWindow):
     def _generate_category(self) -> None:
         if not self._selected_category:
             return
+        self._maybe_save_category_paths()
         assets = self.config_mgr.assets(category=self._selected_category)
         self._run_generate(assets)
 
@@ -2786,6 +2811,7 @@ class ArtToolApp(BaseWindow):
         if not self._selected_category:
             messagebox.showinfo("提示", "请先选择分类")
             return
+        self._maybe_save_category_paths()
         assets = self.config_mgr.assets(category=self._selected_category)
         if not assets:
             messagebox.showinfo("提示", "本类无资源")

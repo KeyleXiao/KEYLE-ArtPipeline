@@ -192,8 +192,12 @@ let cropLoading = false;
 let cropEntering = false;
 let cropSubModeLoading = false;
 let cropLoadSeq = 0;
-/** @type {Map<string, Blob>} */
+/** 图层 PNG 缓存世代；自适应裁切等写回后递增，避免悬停预取写入过期 blob */
+let cropRawBlobEpoch = 0;
+/** @type {Map<string, { epoch: number, blob: Blob }>} */
 const cropRawBlobCache = new Map();
+/** @type {AbortController | null} */
+let cropLayerFetchAbort = null;
 /** @type {{ data: Uint8ClampedArray, w: number, h: number, layerId: string } | null} */
 let freeCropWork = null;
 let freeCropBitmap = null;
@@ -204,6 +208,8 @@ let freeCropClipboard = null;
 let freeCropDirty = false;
 /** @type {{ anchor: { x: number, y: number }, square: boolean } | null} */
 let freeCropDrag = null;
+let cropDrawRaf = 0;
+let cropPointerCaptureId = null;
 /** @type {{ data: Uint8ClampedArray, w: number, h: number, layerId: string } | null} */
 let matrixWork = null;
 let matrixHLines = [];
@@ -2547,6 +2553,47 @@ function withTimeout(promise, ms, message) {
   });
 }
 
+async function blobToImageBitmap(blob, timeoutMs = 30000) {
+  if (!blob || blob.size < 8) throw new Error(t("pp.noPreviewFile"));
+
+  const decodeViaImage = () =>
+    new Promise((resolve, reject) => {
+      const img = new Image();
+      const url = URL.createObjectURL(blob);
+      img.onload = () => {
+        URL.revokeObjectURL(url);
+        resolve(img);
+      };
+      img.onerror = () => {
+        URL.revokeObjectURL(url);
+        reject(new Error(t("pp.noPreviewFile")));
+      };
+      img.src = url;
+    });
+
+  if (typeof createImageBitmap !== "function") {
+    return decodeViaImage();
+  }
+
+  try {
+    return await withTimeout(createImageBitmap(blob), timeoutMs, t("pp.cropTimeout"));
+  } catch (err) {
+    cropLog(`createImageBitmap 失败，回退 Image 解码: ${err.message}`, "系统");
+    return decodeViaImage();
+  }
+}
+
+function abortCropEnterIfStale(loadSeq) {
+  if (loadSeq === cropLoadSeq && cropMode) return false;
+  cropLog("进入裁切：加载已取消（用户退出或新请求）", "系统");
+  if (loadSeq === cropLoadSeq) {
+    cropLoading = false;
+    cropEntering = false;
+    updateCropModeUi();
+  }
+  return true;
+}
+
 function setCropPanelMessage(msg) {
   const info = $("#pp-crop-info");
   if (info) info.textContent = msg || "";
@@ -2592,11 +2639,24 @@ function resetStaleCropState() {
 
 function requestCropMode() {
   resetStaleCropState();
+  if (cropMode) {
+    if (cropLoading || cropEntering) {
+      cropLog("裁切加载未完成，强制重试", "操作");
+      exitCropMode();
+      void enterCropMode();
+      return;
+    }
+    if (!cropRawImg) {
+      cropLog("裁切加载失败，重试进入", "操作");
+      exitCropMode();
+      void enterCropMode();
+    }
+    return;
+  }
   if (cropEntering) {
     flashCropFeedback(t("pp.cropLoading"));
     return;
   }
-  if (cropMode) return;
   const layer = selectedLayer();
   if (!layer || layer.type !== "image") {
     flashCropFeedback(t("pp.cropNeedImage"));
@@ -2610,8 +2670,9 @@ function requestCropMode() {
 }
 
 function invalidateCropLayerCache(layerId) {
+  cropRawBlobEpoch += 1;
+  cropRawBlobCache.clear();
   if (!layerId) return;
-  cropRawBlobCache.delete(layerId);
   if (matteFullState.layerId !== layerId || !matteFullState.data) return;
   invalidateMatteFull();
   if (mattePreviewState.layerId === layerId) {
@@ -2623,24 +2684,27 @@ function invalidateCropLayerCache(layerId) {
   }
 }
 
-async function matteFetchRawBlob(layerId) {
-  applyPropsFromForm();
+async function matteFetchRawBlob(layerId, { skipFormSync = false, signal } = {}) {
+  if (!skipFormSync) applyPropsFromForm();
   const body = previewBody({ layer_id: layerId });
   try {
     const res = await fetch(`/api/assets/${encodeURIComponent(assetId)}/postprocess/layer-raw`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+      cache: "no-store",
+      signal,
     });
     if (!res.ok) {
       const detail = (await res.text()).slice(0, 200) || res.statusText;
       matteLog(`layer-raw 失败 (${res.status}): ${detail}`, "系统");
-      return null;
+      throw new Error(`${t("pp.noPreviewFile")} (${res.status}: ${detail})`);
     }
     return await res.blob();
   } catch (err) {
+    if (err?.name === "AbortError") throw err;
     matteLog(`layer-raw 异常: ${err.message}`, "系统");
-    return null;
+    throw err instanceof Error ? err : new Error(String(err));
   }
 }
 
@@ -3488,22 +3552,29 @@ function bindEscapeHandler() {
 
 // ── 裁切（矩形取景 + 矩阵裁切 + 自由裁切） ─────────────────
 
-async function fetchCropLayerBlob(layer) {
+async function fetchCropLayerBlob(layer, { signal } = {}) {
+  const reqEpoch = cropRawBlobEpoch;
   if (isSubjectLayer(layer)) {
     const res = await fetch(
-      `/api/assets/${encodeURIComponent(assetId)}/postprocess/subject-raw.png?subject=${encodeURIComponent(subjectMode || "inbox")}`,
+      `/api/assets/${encodeURIComponent(assetId)}/postprocess/subject-raw.png?subject=${encodeURIComponent(subjectMode || "inbox")}&v=${cropRawBlobEpoch}`,
+      { cache: "no-store", signal },
     );
     if (!res.ok) {
       const detail = (await res.text()).slice(0, 120) || res.statusText;
       throw new Error(`${t("pp.noPreviewFile")} (${res.status}: ${detail})`);
     }
-    return res.blob();
+    const blob = await res.blob();
+    if (!blob || blob.size < 8) throw new Error(t("pp.noPreviewFile"));
+    return blob;
   }
   const id = layer.id;
-  if (cropRawBlobCache.has(id)) return cropRawBlobCache.get(id);
-  const blob = await matteFetchRawBlob(id);
-  if (!blob) throw new Error(t("pp.noPreviewFile"));
-  cropRawBlobCache.set(id, blob);
+  const cached = cropRawBlobCache.get(id);
+  if (cached && cached.epoch === cropRawBlobEpoch) return cached.blob;
+  const blob = await matteFetchRawBlob(id, { skipFormSync: true, signal });
+  if (!blob || blob.size < 8) throw new Error(t("pp.noPreviewFile"));
+  if (reqEpoch === cropRawBlobEpoch) {
+    cropRawBlobCache.set(id, { epoch: cropRawBlobEpoch, blob });
+  }
   return blob;
 }
 
@@ -4009,17 +4080,25 @@ async function ensureMatrixWork(layer) {
   }
 }
 
-async function loadRectCropWork(layer) {
+async function loadRectCropWork(layer, { signal, loadSeq } = {}) {
   const blob = await withTimeout(
-    fetchCropLayerBlob(layer),
+    fetchCropLayerBlob(layer, { signal }),
     60000,
     t("pp.cropTimeout"),
   );
+  if (loadSeq != null && abortCropEnterIfStale(loadSeq)) return;
   if (cropRawImg) cropRawImg.close?.();
-  cropRawImg = await createImageBitmap(blob);
+  const bitmap = await blobToImageBitmap(blob);
+  if (loadSeq != null && abortCropEnterIfStale(loadSeq)) {
+    bitmap.close?.();
+    return;
+  }
+  cropRawImg = bitmap;
   cropRawSize = { w: cropRawImg.width, h: cropRawImg.height };
-  if (layer.crop?.w > 0 && layer.crop?.h > 0) {
-    cropPreview = { ...layer.crop };
+  const liveLayer = selectedLayer();
+  const crop = liveLayer?.id === layer.id ? liveLayer.crop : layer.crop;
+  if (crop?.w > 0 && crop?.h > 0) {
+    cropPreview = { ...crop };
   } else {
     cropPreview = null;
   }
@@ -4099,30 +4178,22 @@ async function enterCropMode() {
   setStatus(t("pp.cropLoading"));
   cropLog(`进入裁切: ${layer.name || layer.id}`, "操作");
 
+  cropLayerFetchAbort?.abort();
+  const loadAbort = new AbortController();
+  cropLayerFetchAbort = loadAbort;
+
   const t0 = performance.now();
   try {
     if (matteMode || matteStrokeActive) {
       await exitMatteMode({ skipPreviewRefresh: true });
-      if (!cropMode || loadSeq !== cropLoadSeq) return;
+      if (abortCropEnterIfStale(loadSeq)) return;
       setStatus(t("pp.cropLoading"));
       setCropPanelMessage(t("pp.cropLoading"));
       drawCropLoadingCanvas();
     }
-    if (!cropMode || loadSeq !== cropLoadSeq) {
-      cropLog("进入裁切：加载已取消（用户退出或新请求）", "系统");
-      cropLoading = false;
-      cropEntering = false;
-      updateCropModeUi();
-      return;
-    }
-    await loadRectCropWork(layer);
-    if (!cropMode || loadSeq !== cropLoadSeq) {
-      cropLog("进入裁切：加载已取消（用户退出或新请求）", "系统");
-      cropLoading = false;
-      cropEntering = false;
-      updateCropModeUi();
-      return;
-    }
+    if (abortCropEnterIfStale(loadSeq)) return;
+    await loadRectCropWork(layer, { signal: loadAbort.signal, loadSeq });
+    if (abortCropEnterIfStale(loadSeq)) return;
     cropLoading = false;
     updateCropModeUi();
     scheduleCropCanvasLayout();
@@ -4135,6 +4206,7 @@ async function enterCropMode() {
       isSubjectLayer(layer) ? t("pp.cropModeEnterSubject") : t("pp.cropModeEnter"),
     );
   } catch (err) {
+    if (err?.name === "AbortError" || abortCropEnterIfStale(loadSeq)) return;
     cropLoading = false;
     const msg = err?.message || String(err);
     cropLog(`进入裁切失败: ${msg}`, "系统");
@@ -4143,6 +4215,7 @@ async function enterCropMode() {
     setStatus(`${t("pp.cropFailed")}: ${msg}`);
     updateCropModeUi();
   } finally {
+    if (cropLayerFetchAbort === loadAbort) cropLayerFetchAbort = null;
     cropEntering = false;
     if (loadSeq === cropLoadSeq) updateCropModeUi();
   }
@@ -4164,6 +4237,8 @@ function resetMatrixCropState() {
 
 function exitCropMode() {
   cropLoadSeq += 1;
+  cropLayerFetchAbort?.abort();
+  cropLayerFetchAbort = null;
   cropMode = false;
   cropLoading = false;
   cropEntering = false;
@@ -4204,7 +4279,7 @@ function getCropCanvasScale() {
   return canvas.width / size.w;
 }
 
-function cropEventPos(e) {
+function cropEventPos(e, { clampToRaw = false } = {}) {
   const canvas = $("#pp-crop-canvas");
   const rect = canvas.getBoundingClientRect();
   const sx = rect.width > 0 ? canvas.width / rect.width : 1;
@@ -4212,7 +4287,178 @@ function cropEventPos(e) {
   const cx = (e.clientX - rect.left) * sx;
   const cy = (e.clientY - rect.top) * sy;
   const scale = getCropCanvasScale();
-  return { cx, cy, rx: cx / scale, ry: cy / scale, scale };
+  let rx = cx / scale;
+  let ry = cy / scale;
+  if (clampToRaw) {
+    const size = activeCropRawSize();
+    if (size.w > 0) rx = Math.max(0, Math.min(size.w, rx));
+    if (size.h > 0) ry = Math.max(0, Math.min(size.h, ry));
+  }
+  return { cx, cy, rx, ry, scale };
+}
+
+function scheduleCropDrawDuringDrag() {
+  if (cropDrawRaf) return;
+  cropDrawRaf = requestAnimationFrame(() => {
+    cropDrawRaf = 0;
+    drawCropCanvas();
+    updateCropInfo();
+  });
+}
+
+function beginCropPointerCapture(canvas, e) {
+  if (!canvas || e.button !== 0) return;
+  try {
+    canvas.setPointerCapture(e.pointerId);
+    cropPointerCaptureId = e.pointerId;
+  } catch {
+    cropPointerCaptureId = null;
+  }
+}
+
+function endCropPointerCapture(canvas, e) {
+  if (!canvas) return;
+  if (cropPointerCaptureId != null && canvas.hasPointerCapture?.(cropPointerCaptureId)) {
+    try {
+      canvas.releasePointerCapture(cropPointerCaptureId);
+    } catch {
+      /* ignore */
+    }
+  }
+  cropPointerCaptureId = null;
+}
+
+function finishCropDrag(e) {
+  const cropCanvas = $("#pp-crop-canvas");
+  if (cropSubMode === "rect" && cropDrag?.mode === "create") {
+    if (!cropPreview || cropPreview.w < 4 || cropPreview.h < 4) {
+      cropPreview = null;
+    }
+  }
+  cropDrag = null;
+  matrixDrag = null;
+  freeCropDrag = null;
+  endCropPointerCapture(cropCanvas, e);
+  if (cropDrawRaf) {
+    cancelAnimationFrame(cropDrawRaf);
+    cropDrawRaf = 0;
+  }
+  drawCropCanvas();
+  updateCropInfo();
+}
+
+function updateFreeCropSelectionFromPointer(e) {
+  if (!freeCropDrag || !freeCropWork) return;
+  const { rx, ry } = cropEventPos(e, { clampToRaw: true });
+  let x = Math.min(freeCropDrag.anchor.x, rx);
+  let y = Math.min(freeCropDrag.anchor.y, ry);
+  let w = Math.max(1, Math.abs(rx - freeCropDrag.anchor.x));
+  let h = Math.max(1, Math.abs(ry - freeCropDrag.anchor.y));
+  if (e.shiftKey || freeCropDrag.square) {
+    const side = Math.max(w, h);
+    w = h = side;
+    if (rx < freeCropDrag.anchor.x) x = freeCropDrag.anchor.x - side;
+    if (ry < freeCropDrag.anchor.y) y = freeCropDrag.anchor.y - side;
+  }
+  freeCropSelection = clampRect(x, y, w, h, freeCropWork.w, freeCropWork.h);
+  scheduleCropDrawDuringDrag();
+}
+
+function handleCropPointerMove(e) {
+  const cropCanvas = $("#pp-crop-canvas");
+  if (canvasPan?.mode === "crop") {
+    moveCanvasPan(e);
+    return;
+  }
+  if (!cropMode || cropLoading || cropSubModeLoading) return;
+  const { cx, cy, rx, ry } = cropEventPos(e, { clampToRaw: !!freeCropDrag });
+
+  if (cropSubMode === "free") {
+    if (freeCropDrag) {
+      updateFreeCropSelectionFromPointer(e);
+    } else {
+      cropCanvas.style.cursor = "crosshair";
+    }
+    return;
+  }
+
+  if (cropSubMode === "matrix") {
+    if (matrixDrag && matrixWork) {
+      const raw = cropEventPos(e, { clampToRaw: true });
+      if (matrixDrag.type === "h") {
+        const sorted = normalizeGridLines(matrixHLines, matrixVLines, matrixWork.w, matrixWork.h)
+          .hLines;
+        const next = [...sorted];
+        next[matrixDrag.index] = clampLineMove(next, matrixDrag.index, raw.ry, matrixWork.h);
+        matrixHLines = next;
+      } else {
+        const sorted = normalizeGridLines(matrixHLines, matrixVLines, matrixWork.w, matrixWork.h)
+          .vLines;
+        const next = [...sorted];
+        next[matrixDrag.index] = clampLineMove(next, matrixDrag.index, raw.rx, matrixWork.w);
+        matrixVLines = next;
+      }
+      onMatrixGridChanged();
+      scheduleCropDrawDuringDrag();
+    } else if (matrixWork) {
+      const scale = getCropCanvasScale();
+      const { hLines, vLines } = normalizeGridLines(
+        matrixHLines,
+        matrixVLines,
+        matrixWork.w,
+        matrixWork.h,
+      );
+      const prevHover = matrixDeleteHover;
+      const delHit = hitTestMatrixLineDelete(
+        cx,
+        cy,
+        scale,
+        hLines,
+        vLines,
+        cropCanvas.width,
+        cropCanvas.height,
+      );
+      matrixDeleteHover = delHit;
+      if (delHit) {
+        cropCanvas.style.cursor = "pointer";
+        if (matrixDeleteHoverChanged(prevHover, delHit)) drawCropCanvas();
+        return;
+      }
+      if (matrixDeleteHoverChanged(prevHover, null)) drawCropCanvas();
+      const lineHit = hitTestGridLine(cx, cy, rx, ry, scale, hLines, vLines);
+      if (lineHit?.type === "h") cropCanvas.style.cursor = "ns-resize";
+      else if (lineHit?.type === "v") cropCanvas.style.cursor = "ew-resize";
+      else cropCanvas.style.cursor = "crosshair";
+    }
+    return;
+  }
+
+  if (cropDrag) {
+    const raw = cropEventPos(e, { clampToRaw: true });
+    if (cropDrag.mode === "create") {
+      cropPreview = applyCropCreate(cropDrag.anchor, raw.rx, raw.ry, e.shiftKey || cropDrag.square);
+    } else if (cropDrag.mode === "move") {
+      const dx = raw.rx - cropDrag.start.x;
+      const dy = raw.ry - cropDrag.start.y;
+      cropPreview = clampCrop({
+        x: cropDrag.orig.x + dx,
+        y: cropDrag.orig.y + dy,
+        w: cropDrag.orig.w,
+        h: cropDrag.orig.h,
+      });
+    } else if (cropDrag.mode === "resize") {
+      cropPreview = applyCropResize(
+        cropDrag.orig,
+        cropDrag.handle,
+        raw.rx,
+        raw.ry,
+        e.shiftKey || cropDrag.square,
+      );
+    }
+    scheduleCropDrawDuringDrag();
+  } else {
+    cropCanvas.style.cursor = cropCursorForHit(hitTestCrop(cx, cy));
+  }
 }
 
 function clampCrop(c) {
@@ -4800,21 +5046,20 @@ function bindCropCanvas() {
   cropWrap?.addEventListener("contextmenu", preventCanvasContextMenu);
   cropCanvas.addEventListener("contextmenu", preventCanvasContextMenu);
 
-  cropCanvas.addEventListener("mousedown", (e) => {
+  cropCanvas.addEventListener("pointerdown", (e) => {
     if (!cropMode || e.button !== 0 || cropLoading || cropSubModeLoading) return;
     e.preventDefault();
-    const { cx, cy, rx, ry } = cropEventPos(e);
+    const { cx, cy, rx, ry } = cropEventPos(e, { clampToRaw: true });
+    let captureDrag = false;
 
     if (cropSubMode === "free") {
       if (!freeCropWork) return;
       freeCropDrag = { anchor: { x: rx, y: ry }, square: e.shiftKey };
       freeCropSelection = clampFreeSelection({ x: rx, y: ry, w: 1, h: 1 });
+      captureDrag = true;
       drawCropCanvas();
       updateCropInfo();
-      return;
-    }
-
-    if (cropSubMode === "matrix") {
+    } else if (cropSubMode === "matrix") {
       if (!matrixWork) return;
       const scale = getCropCanvasScale();
       const canvas = cropCanvas;
@@ -4841,171 +5086,73 @@ function bindCropCanvas() {
       if (lineHit) {
         matrixSelectedLine = { type: lineHit.type, index: lineHit.index };
         matrixDrag = lineHit;
+        captureDrag = true;
         drawCropCanvas();
+      } else {
+        matrixSelectedLine = null;
+        const cell = cellAtPoint(rx, ry, matrixWork.w, matrixWork.h, matrixHLines, matrixVLines);
+        if (!cell) return;
+        const key = cellKey(cell.r, cell.c);
+        if (matrixRemoved.has(key)) matrixRemoved.delete(key);
+        else matrixRemoved.add(key);
+        drawCropCanvas();
+        updateCropInfo();
+      }
+    } else {
+      const hit = hitTestCrop(cx, cy);
+      if (hit.type === "close") {
+        clearRectCropSelection();
         return;
       }
-      matrixSelectedLine = null;
-      const cell = cellAtPoint(rx, ry, matrixWork.w, matrixWork.h, matrixHLines, matrixVLines);
-      if (!cell) return;
-      const key = cellKey(cell.r, cell.c);
-      if (matrixRemoved.has(key)) matrixRemoved.delete(key);
-      else matrixRemoved.add(key);
-      drawCropCanvas();
-      updateCropInfo();
-      return;
-    }
-
-    const hit = hitTestCrop(cx, cy);
-    if (hit.type === "close") {
-      clearRectCropSelection();
-      return;
-    }
-    if (hit.type === "create") {
-      cropDrag = { mode: "create", anchor: { x: rx, y: ry }, square: e.shiftKey };
-    } else if (hit.type === "move") {
-      cropDrag = { mode: "move", start: { x: rx, y: ry }, orig: { ...cropPreview } };
-    } else {
-      cropDrag = { mode: "resize", handle: hit.handle, orig: { ...cropPreview }, square: e.shiftKey };
-    }
-    drawCropCanvas();
-    updateCropInfo();
-  });
-
-  cropCanvas.addEventListener("mousemove", (e) => {
-    if (canvasPan?.mode === "crop") {
-      moveCanvasPan(e);
-      return;
-    }
-    if (!cropMode || cropLoading || cropSubModeLoading) return;
-    const { cx, cy, rx, ry } = cropEventPos(e);
-
-    if (cropSubMode === "free") {
-      if (freeCropDrag && freeCropWork) {
-        let x = Math.min(freeCropDrag.anchor.x, rx);
-        let y = Math.min(freeCropDrag.anchor.y, ry);
-        let w = Math.max(1, Math.abs(rx - freeCropDrag.anchor.x));
-        let h = Math.max(1, Math.abs(ry - freeCropDrag.anchor.y));
-        if (e.shiftKey || freeCropDrag.square) {
-          const side = Math.max(w, h);
-          w = h = side;
-          if (rx < freeCropDrag.anchor.x) x = freeCropDrag.anchor.x - side;
-          if (ry < freeCropDrag.anchor.y) y = freeCropDrag.anchor.y - side;
-        }
-        freeCropSelection = clampRect(x, y, w, h, freeCropWork.w, freeCropWork.h);
-        drawCropCanvas();
-        updateCropInfo();
+      if (hit.type === "create") {
+        cropDrag = { mode: "create", anchor: { x: rx, y: ry }, square: e.shiftKey };
+      } else if (hit.type === "move") {
+        cropDrag = { mode: "move", start: { x: rx, y: ry }, orig: { ...cropPreview } };
       } else {
-        cropCanvas.style.cursor = "crosshair";
+        cropDrag = {
+          mode: "resize",
+          handle: hit.handle,
+          orig: { ...cropPreview },
+          square: e.shiftKey,
+        };
       }
-      return;
-    }
-
-    if (cropSubMode === "matrix") {
-      if (matrixDrag && matrixWork) {
-        if (matrixDrag.type === "h") {
-          const sorted = normalizeGridLines(matrixHLines, matrixVLines, matrixWork.w, matrixWork.h)
-            .hLines;
-          const next = [...sorted];
-          next[matrixDrag.index] = clampLineMove(next, matrixDrag.index, ry, matrixWork.h);
-          matrixHLines = next;
-        } else {
-          const sorted = normalizeGridLines(matrixHLines, matrixVLines, matrixWork.w, matrixWork.h)
-            .vLines;
-          const next = [...sorted];
-          next[matrixDrag.index] = clampLineMove(next, matrixDrag.index, rx, matrixWork.w);
-          matrixVLines = next;
-        }
-        onMatrixGridChanged();
-        drawCropCanvas();
-        updateCropInfo();
-      } else if (matrixWork) {
-        const scale = getCropCanvasScale();
-        const { hLines, vLines } = normalizeGridLines(
-          matrixHLines,
-          matrixVLines,
-          matrixWork.w,
-          matrixWork.h,
-        );
-        const prevHover = matrixDeleteHover;
-        const delHit = hitTestMatrixLineDelete(
-          cx,
-          cy,
-          scale,
-          hLines,
-          vLines,
-          cropCanvas.width,
-          cropCanvas.height,
-        );
-        matrixDeleteHover = delHit;
-        if (delHit) {
-          cropCanvas.style.cursor = "pointer";
-          if (matrixDeleteHoverChanged(prevHover, delHit)) drawCropCanvas();
-          return;
-        }
-        if (matrixDeleteHoverChanged(prevHover, null)) drawCropCanvas();
-        const lineHit = hitTestGridLine(cx, cy, rx, ry, scale, hLines, vLines);
-        if (lineHit?.type === "h") cropCanvas.style.cursor = "ns-resize";
-        else if (lineHit?.type === "v") cropCanvas.style.cursor = "ew-resize";
-        else cropCanvas.style.cursor = "crosshair";
-      }
-      return;
-    }
-
-    if (cropDrag) {
-      if (cropDrag.mode === "create") {
-        cropPreview = applyCropCreate(cropDrag.anchor, rx, ry, e.shiftKey || cropDrag.square);
-      } else if (cropDrag.mode === "move") {
-        const dx = rx - cropDrag.start.x;
-        const dy = ry - cropDrag.start.y;
-        cropPreview = clampCrop({
-          x: cropDrag.orig.x + dx,
-          y: cropDrag.orig.y + dy,
-          w: cropDrag.orig.w,
-          h: cropDrag.orig.h,
-        });
-      } else if (cropDrag.mode === "resize") {
-        cropPreview = applyCropResize(
-          cropDrag.orig,
-          cropDrag.handle,
-          rx,
-          ry,
-          e.shiftKey || cropDrag.square,
-        );
-      }
+      captureDrag = true;
       drawCropCanvas();
       updateCropInfo();
-    } else {
-      cropCanvas.style.cursor = cropCursorForHit(hitTestCrop(cx, cy));
     }
+
+    if (captureDrag) beginCropPointerCapture(cropCanvas, e);
   });
 
-  cropCanvas.addEventListener("mouseup", (e) => {
+  cropCanvas.addEventListener("pointermove", (e) => {
+    handleCropPointerMove(e);
+  });
+
+  cropCanvas.addEventListener("pointerup", (e) => {
     if (!cropMode || e.button !== 0) return;
-    if (cropSubMode === "rect" && cropDrag?.mode === "create") {
-      if (!cropPreview || cropPreview.w < 4 || cropPreview.h < 4) {
-        cropPreview = null;
-        drawCropCanvas();
-        updateCropInfo();
-      }
-    }
-    cropDrag = null;
-    matrixDrag = null;
-    freeCropDrag = null;
+    finishCropDrag(e);
+  });
+
+  cropCanvas.addEventListener("pointercancel", (e) => {
+    finishCropDrag(e);
+  });
+
+  cropCanvas.addEventListener("lostpointercapture", () => {
+    cropPointerCaptureId = null;
   });
 
   cropCanvas.addEventListener("mouseleave", () => {
-    if (!cropDrag && !matrixDrag) cropCanvas.style.cursor = "crosshair";
+    if (!cropDrag && !matrixDrag && !freeCropDrag) cropCanvas.style.cursor = "crosshair";
     if (matrixDeleteHover) {
       matrixDeleteHover = null;
       if (cropSubMode === "matrix") drawCropCanvas();
     }
   });
 
-  window.addEventListener("mouseup", (e) => {
+  window.addEventListener("pointerup", (e) => {
     if (!cropMode || e.button !== 0) return;
-    cropDrag = null;
-    matrixDrag = null;
-    freeCropDrag = null;
+    if (!cropDrag && !matrixDrag && !freeCropDrag) return;
+    finishCropDrag(e);
   });
 }
 
@@ -5508,6 +5655,7 @@ async function autoTrimLayerAlpha(btn) {
     setStatus(t("pp.autoCropExitCropMode"));
     return;
   }
+  if (cropEntering || cropLoading) exitCropMode();
   await withBtnBusy(btn || $("#pp-auto-crop"), async () => {
     if (rotationPreviewState.active) await commitRotationPreview();
     await pushHistoryBefore({ includeImages: true });
@@ -5524,6 +5672,7 @@ async function autoTrimLayerAlpha(btn) {
       return;
     }
     if (r.stack) stack = r.stack;
+    exitCropMode();
     invalidateCropLayerCache(layer.id);
     fillProps();
     fillCanvasSizeInputs();

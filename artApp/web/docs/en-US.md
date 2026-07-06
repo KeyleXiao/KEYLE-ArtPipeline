@@ -53,6 +53,8 @@ Open the URL shown in the terminal (default `http://127.0.0.1:8765`).
 - **in (inbox)**: green = matches source, yellow = post-processed, red = missing
 - **U (engine)**: green = matches inbox, red = missing or needs re-export
 
+![Main workbench — categories · assets · S·in·U · AI assistant · ComfyUI / cloud tabs](images/main-workbench.png)
+
 ### Main UI actions
 
 | Action | Description |

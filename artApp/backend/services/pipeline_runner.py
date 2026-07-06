@@ -8,7 +8,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from backend.deps import get_config_manager
+from backend.deps import get_config_manager, reload_config_manager
 from backend.services.log_bus import log_bus
 
 
@@ -199,8 +199,6 @@ class PipelineRunner:
         from cloud.runner import partition_assets_by_backend, run_cloud_batch
         from pipeline_core import PipelineCore
 
-        from backend.deps import reload_config_manager
-
         config = reload_config_manager()
         pipeline = PipelineCore(config)
         pipeline.clear_cancel()
@@ -309,7 +307,7 @@ class PipelineRunner:
     def _run_export(self, req: JobRequest) -> None:
         from pipeline_core import PipelineCore
 
-        config = get_config_manager()
+        config = reload_config_manager()
         pipeline = PipelineCore(config)
         assets = [a for aid in req.asset_ids if (a := config.asset_by_id(aid))]
         if not assets:

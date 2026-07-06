@@ -48,6 +48,39 @@
           <p class="brand-sub" data-i18n="app.subtitle">KEYLE· 美术流水线</p>
         </div>
       </div>
+      <nav class="toolbar toolbar-nav" aria-label="Pipeline actions">
+        <div class="nav-group">
+          <button type="button" class="btn sm ghost nav-trigger" id="nav-generate-trigger" aria-expanded="false" aria-haspopup="true">
+            <span data-i18n="toolbar.menuGenerate">生成</span>
+            <span class="nav-caret" aria-hidden="true">▾</span>
+          </button>
+          <div class="nav-dropdown hidden" id="nav-generate-menu" role="menu">
+            <button type="button" class="nav-item accent" data-pipeline="gen-selected" data-i18n="toolbar.genSelected">生成选中</button>
+            <button type="button" class="nav-item" data-pipeline="gen-category" data-i18n="toolbar.genCategory">生成本类</button>
+            <button type="button" class="nav-item" data-pipeline="gen-export" data-i18n="toolbar.genExport">生成并导出</button>
+          </div>
+        </div>
+        <div class="nav-group">
+          <button type="button" class="btn sm ghost nav-trigger" id="nav-export-trigger" aria-expanded="false" aria-haspopup="true">
+            <span data-i18n="toolbar.menuExport">导出</span>
+            <span class="nav-caret" aria-hidden="true">▾</span>
+          </button>
+          <div class="nav-dropdown hidden" id="nav-export-menu" role="menu">
+            <button type="button" class="nav-item" data-pipeline="export-selected" data-i18n="toolbar.export">导出到游戏引擎</button>
+            <button type="button" class="nav-item" data-pipeline="export-category" data-i18n="toolbar.exportCategory">导出本类</button>
+          </div>
+        </div>
+        <div class="nav-group">
+          <button type="button" class="btn sm ghost nav-trigger" id="nav-config-trigger" aria-expanded="false" aria-haspopup="true">
+            <span data-i18n="toolbar.menuConfig">配置</span>
+            <span class="nav-caret" aria-hidden="true">▾</span>
+          </button>
+          <div class="nav-dropdown hidden" id="nav-config-menu" role="menu">
+            <button type="button" class="nav-item" data-pipeline="save-config" data-i18n="toolbar.saveConfig">保存配置</button>
+            <button type="button" class="nav-item" data-pipeline="reload-config" data-i18n="toolbar.reloadConfig">重载配置</button>
+          </div>
+        </div>
+      </nav>
       <div class="topbar-right">
         <div class="lang-switch" role="group" aria-label="Language">
           <button type="button" class="lang-btn" data-lang="zh-CN" data-i18n="lang.zh">中文</button>
@@ -1047,9 +1080,7 @@
 
   <dialog id="dlg-confirm" class="confirm-dialog">
     <div class="confirm-dialog-inner">
-      <div class="confirm-icon danger" id="confirm-icon" aria-hidden="true">
-        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/></svg>
-      </div>
+      <div class="confirm-icon danger" id="confirm-icon" aria-hidden="true"></div>
       <h3 id="confirm-title"></h3>
       <p class="confirm-message muted" id="confirm-message"></p>
       <ul class="confirm-details hidden" id="confirm-details"></ul>
