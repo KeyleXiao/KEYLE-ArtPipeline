@@ -144,21 +144,6 @@
           <span class="gen-tab-section-title" data-i18n="pp.props">属性</span>
         </div>
         <form id="pp-props-form" class="pp-props-form">
-          <fieldset id="pp-canvas-size-panel" class="pp-field-block" hidden>
-            <legend class="settings-subhead" data-i18n="pp.canvasSize">画布尺寸</legend>
-            <p class="settings-hint muted sm pp-canvas-size-hint" data-i18n="pp.canvasSizeHint">仅 source 编辑；应用时写入原图并更新资源尺寸</p>
-            <div class="settings-field-grid settings-field-grid--2">
-              <label class="gen-field">
-                <span data-i18n="pp.canvasWidth">宽</span>
-                <input id="pp-canvas-w" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" />
-              </label>
-              <label class="gen-field">
-                <span data-i18n="pp.canvasHeight">高</span>
-                <input id="pp-canvas-h" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" />
-              </label>
-            </div>
-          </fieldset>
-
           <div class="pp-acc-card pp-acc--basic" id="pp-acc-basic">
             <div class="pp-acc-head">
               <span class="pp-acc-icon" aria-hidden="true"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 21V9"/></svg></span>
@@ -200,6 +185,46 @@
               </div>
             </div>
           </div>
+
+          <details class="pp-acc pp-acc--canvas" id="pp-acc-canvas-size" open>
+            <summary class="pp-acc-head">
+              <span class="pp-acc-icon" aria-hidden="true"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6"/><path d="m21 3-7 7"/><path d="M9 21H3v-6"/><path d="m3 21 7-7"/><path d="M21 15v6h-6"/><path d="m21 21-7-7"/><path d="M3 9V3h6"/><path d="m3 3 7 7"/></svg></span>
+              <span class="pp-acc-title" data-i18n="pp.sectionCanvasSize">尺寸修改</span>
+            </summary>
+            <div class="pp-acc-body" id="pp-canvas-resize-body">
+              <p class="settings-hint muted sm" data-i18n="pp.canvasResizeLead">修改画布尺寸并实时预览；应用到 inbox / source 时写入合成结果。</p>
+              <div class="pp-canvas-size-compare" aria-live="polite">
+                <div class="pp-canvas-size-chip">
+                  <span class="pp-canvas-size-label" data-i18n="pp.canvasSizeCurrent">当前</span>
+                  <strong id="pp-canvas-size-current">—</strong>
+                </div>
+                <span class="pp-canvas-size-arrow" aria-hidden="true">→</span>
+                <div class="pp-canvas-size-chip pp-canvas-size-chip--target">
+                  <span class="pp-canvas-size-label" data-i18n="pp.canvasSizeTarget">目标</span>
+                  <strong id="pp-canvas-size-target">—</strong>
+                </div>
+              </div>
+              <div class="settings-field-grid settings-field-grid--2">
+                <label class="gen-field">
+                  <span data-i18n="pp.canvasWidth">宽</span>
+                  <input id="pp-resize-w" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" />
+                </label>
+                <label class="gen-field">
+                  <span data-i18n="pp.canvasHeight">高</span>
+                  <input id="pp-resize-h" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" />
+                </label>
+              </div>
+              <label class="check check-modern check-block">
+                <input type="checkbox" id="pp-resize-scale-content" />
+                <span class="check-ui"></span>
+                <span class="check-text" data-i18n="pp.canvasScaleContent">同时缩放图层内容（整体放大/缩小）</span>
+              </label>
+              <p class="settings-hint muted sm" data-i18n="pp.canvasScaleContentHint">未勾选时仅改变画布大小，图层像素尺寸与位置不变（可能裁切或留白）。</p>
+              <div class="gen-tab-actions">
+                <button type="button" class="btn sm ghost" id="pp-resize-reset" data-i18n="pp.canvasSizeReset">恢复当前尺寸</button>
+              </div>
+            </div>
+          </details>
 
           <details class="pp-acc pp-acc--blend" id="pp-acc-blend">
             <summary class="pp-acc-head">

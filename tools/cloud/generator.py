@@ -97,6 +97,17 @@ def _resolve_ref_paths(config: ConfigManager, asset: Asset, mode: str) -> tuple[
     return ref_path, base_path
 
 
+def _extra_ref_paths_for_asset(config: ConfigManager, asset: Asset, mode: str) -> list[Path]:
+    if mode != CLOUD_GEN_MODE_I2I:
+        return []
+    raw = str(getattr(asset, "cloud_ref_images_extra", "") or "").strip()
+    if not raw:
+        return []
+    from cloud.providers.volcengine import parse_extra_ref_paths
+
+    return parse_extra_ref_paths(raw, config.art_root())
+
+
 def generate_one_cloud(
     config: ConfigManager,
     asset: Asset,
@@ -124,6 +135,8 @@ def generate_one_cloud(
     ref_path, base_path = _resolve_ref_paths(config, asset, mode)
     strength = float(getattr(asset, "cloud_strength", DEFAULT_CLOUD_STRENGTH) or DEFAULT_CLOUD_STRENGTH)
     strength = max(0.01, min(1.0, strength))
+    output_count = max(1, min(15, int(getattr(asset, "cloud_output_count", 1) or 1)))
+    extra_refs = _extra_ref_paths_for_asset(config, asset, mode)
 
     req = CloudGenerateRequest(
         checkpoint=checkpoint,
@@ -139,6 +152,8 @@ def generate_one_cloud(
         ref_image_path=ref_path,
         base_image_path=base_path,
         api_keys=cloud_keys_from_defaults(config.defaults),
+        extra_ref_paths=extra_refs or None,
+        output_count=output_count,
     )
 
     prov_label = model.get("label_zh") or checkpoint
@@ -161,6 +176,9 @@ def generate_one_cloud(
 
     if not result.ok or not result.png_bytes:
         return GenerateResult(asset.id, False, result.message or "云生成失败")
+
+    if result.message and "共" in result.message:
+        _log(log, f"  {result.message}")
 
     data = result.png_bytes
     if (asset.width, asset.height) != (0, 0):

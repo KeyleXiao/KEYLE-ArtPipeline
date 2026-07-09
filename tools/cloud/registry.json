@@ -19,8 +19,8 @@
     "image_edit": {
       "label_zh": "图像编辑",
       "label_en": "Image Editing",
-      "desc_zh": "以已有图像为底（默认 source 原图），按描述做局部或整体修改。",
-      "desc_en": "Edit an existing image (default: source) from your prompt.",
+      "desc_zh": "以 inbox 工作副本为底（单图 image + scale），按 prompt 修改；不写 source。",
+      "desc_en": "Edit from inbox work copy (single image + scale); output to inbox only.",
       "asset_field": "cloud_gen_mode"
     }
   },
@@ -64,7 +64,13 @@
       "key_fields": ["volcengine"],
       "default_max_parallel": 3,
       "apply_url": "https://console.volcengine.com/ark",
-      "docs_url": "https://www.volcengine.com/docs/82379/1541523"
+      "docs_url": "https://www.volcengine.com/docs/82379/1541523",
+      "size_constraints": {
+        "min_pixels": 3686400,
+        "min_side": 1920,
+        "hint_zh": "即梦 API 要求输出总像素不低于 3,686,400（约 1920×1920）。",
+        "hint_en": "Jimeng API requires at least 3,686,400 pixels (about 1920×1920)."
+      }
     }
   },
   "settings_portals": {
@@ -140,7 +146,7 @@
       "modes": {
         "text_to_image": { "endpoint": "images/generations", "image_param": null },
         "image_to_image": { "endpoint": "images/generations", "image_param": "image" },
-        "image_edit": { "endpoint": "images/generations", "image_param": "image", "edit_prompt": true }
+        "image_edit": { "endpoint": "images/generations", "image_param": "image", "scale_param": "scale", "sequential_param": "sequential_image_generation" }
       }
     }
   ],
@@ -154,6 +160,8 @@
     "cloud_gen_mode": "text_to_image | image_to_image | image_edit",
     "cloud_prompt": "云正向 prompt（单段）",
     "cloud_negative": "云负向 prompt（可选）",
-    "cloud_strength": "参考强度，图生图 / 图像编辑时生效，默认 0.65"
+    "cloud_strength": "云强度参数：即梦 scale / Stability control_strength / 混元 strength（万相编辑无此项）",
+    "cloud_output_count": "即梦输出张数（1=单图，2–15=组图 sequential auto）",
+    "cloud_ref_images_extra": "即梦多图融合：附加参考图路径（每行一条）"
   }
 }

@@ -37,6 +37,7 @@ const state = {
   searchTimer: null,
   checkpoints: [],
   cloudModels: [],
+  cloudProviders: {},
   cloudGenModes: {},
   jobTimer: null,
   jobRunId: null,
@@ -69,6 +70,8 @@ const previewView = {
   maxZoom: 12,
   panning: null,
 };
+
+let livePreviewRev = 0;
 
 let appBooted = false;
 /** 上次 ComfyUI 在线状态；用于检测离线→在线后刷新本地 checkpoint 列表 */
@@ -315,6 +318,11 @@ async function runGenerate(
   const rows = assetRows || state.assets;
   if (batchNeedsComfy(assetIds, rows) && !(await ensureComfyOnline())) return;
   if (state.assetId && assetIds.includes(state.assetId)) {
+    const ckpt = resolveCheckpointForAssetId(state.assetId);
+    if (cloudProviderFromCheckpoint(ckpt) === "volcengine") {
+      const ok = await maybePromptVolcengineSizeUpdate({ trigger: "generate" });
+      if (!ok) return;
+    }
     if (assetUsesCloudBackend()) {
       await persistCloudAssetFields();
     } else {
@@ -508,6 +516,145 @@ function cloudProviderFromCheckpoint(checkpoint) {
   return rest.split("/")[0] || "";
 }
 
+function volcengineMinPixels() {
+  const sc = state.cloudProviders?.volcengine?.size_constraints;
+  return Number(sc?.min_pixels) || 3_686_400;
+}
+
+function volcengineMinSide() {
+  const sc = state.cloudProviders?.volcengine?.size_constraints;
+  return Number(sc?.min_side) || 1920;
+}
+
+function volcengineSuggestedSize(width, height) {
+  const minPx = volcengineMinPixels();
+  let w = Math.max(1, Math.floor(Number(width) || 0));
+  let h = Math.max(1, Math.floor(Number(height) || 0));
+  if (w * h >= minPx) return { w, h };
+  let scale = Math.sqrt(minPx / (w * h)) * 1.02;
+  let nw = Math.max(w, Math.ceil(w * scale));
+  let nh = Math.max(h, Math.ceil(h * scale));
+  if (nw * nh < minPx) {
+    const bump = Math.sqrt(minPx / (nw * nh)) * 1.01;
+    nw = Math.max(nw, Math.ceil(nw * bump));
+    nh = Math.max(nh, Math.ceil(nh * bump));
+  }
+  return { w: nw, h: nh };
+}
+
+function assetNeedsVolcengineSizeBump(width, height) {
+  const w = Math.max(1, Math.floor(Number(width) || 0));
+  const h = Math.max(1, Math.floor(Number(height) || 0));
+  return w * h < volcengineMinPixels();
+}
+
+function readBasicFormDimensions() {
+  const form = $("#form-basic");
+  const w = parseInt(form?.width?.value, 10) || state.assetFull?.width || 0;
+  const h = parseInt(form?.height?.value, 10) || state.assetFull?.height || 0;
+  return { w, h };
+}
+
+function resolveEffectiveCheckpointFromUi() {
+  const assetCkpt = $("#asset-ckpt")?.value?.trim() || "";
+  if (assetCkpt) return assetCkpt;
+  const catId = $("#form-basic")?.category?.value || state.categoryId;
+  const cat = state.categories.find((c) => c.id === catId);
+  return cat?.checkpoint || "";
+}
+
+async function applyVolcengineSizeSuggestion(suggested, { saveCheckpoint = false } = {}) {
+  if (!state.assetId || !suggested) return;
+  const form = $("#form-basic");
+  if (form?.width) form.width.value = String(suggested.w);
+  if (form?.height) form.height.value = String(suggested.h);
+  const body = { width: suggested.w, height: suggested.h };
+  if (saveCheckpoint) body.checkpoint = $("#asset-ckpt")?.value || "";
+  state.assetFull = await API.put(`/api/assets/${state.assetId}`, body);
+  updateGenerationTabsVisibility();
+  updateCloudTabHero(state.assetFull);
+  updateVolcengineSizeHint();
+  toast(t("toast.volcSizeUpdated", { w: suggested.w, h: suggested.h }));
+}
+
+async function maybePromptVolcengineSizeUpdate({ trigger = "checkpoint", revertOnCancel = false } = {}) {
+  if (!state.assetId) return true;
+  const ckpt = resolveEffectiveCheckpointFromUi();
+  if (cloudProviderFromCheckpoint(ckpt) !== "volcengine") return true;
+  const { w, h } = readBasicFormDimensions();
+  if (!assetNeedsVolcengineSizeBump(w, h)) return true;
+  const suggested = volcengineSuggestedSize(w, h);
+  const minPx = volcengineMinPixels();
+  const ok = await showConfirmDialog({
+    title: t("confirm.volcSize.title"),
+    message: t("confirm.volcSize.message", {
+      w,
+      h,
+      pixels: w * h,
+      minPixels: minPx,
+      minSide: volcengineMinSide(),
+      sw: suggested.w,
+      sh: suggested.h,
+    }),
+    details: [t("confirm.volcSize.detailApi"), t("confirm.volcSize.detailPersist")],
+    confirmText: t("confirm.volcSize.confirm"),
+    cancelText: t("confirm.volcSize.cancel"),
+    danger: false,
+    tone: "warn",
+    icon: "warn",
+  });
+  if (!ok) {
+    if (revertOnCancel) {
+      const sel = $("#asset-ckpt");
+      if (sel) sel.value = assetCkptPrev;
+      updateGenerationTabsVisibility();
+    }
+    return false;
+  }
+  const form = $("#form-basic");
+  if (form?.width) form.width.value = String(suggested.w);
+  if (form?.height) form.height.value = String(suggested.h);
+  if (trigger === "save") {
+    updateVolcengineSizeHint();
+    return true;
+  }
+  const body = { width: suggested.w, height: suggested.h };
+  if (trigger === "checkpoint") body.checkpoint = $("#asset-ckpt")?.value || "";
+  state.assetFull = await API.put(`/api/assets/${state.assetId}`, body);
+  updateGenerationTabsVisibility();
+  updateCloudTabHero(state.assetFull);
+  updateVolcengineSizeHint();
+  toast(t("toast.volcSizeUpdated", { w: suggested.w, h: suggested.h }));
+  return true;
+}
+
+function updateVolcengineSizeHint() {
+  const el = $("#cloud-volc-size-hint");
+  if (!el) return;
+  if (currentCloudProvider() !== "volcengine" || !state.assetId) {
+    el.classList.add("hidden");
+    el.textContent = "";
+    return;
+  }
+  const { w, h } = readBasicFormDimensions();
+  if (!assetNeedsVolcengineSizeBump(w, h)) {
+    el.classList.add("hidden");
+    el.textContent = "";
+    return;
+  }
+  const suggested = volcengineSuggestedSize(w, h);
+  el.textContent = t("form.volcSizeHintTooSmall", {
+    w,
+    h,
+    sw: suggested.w,
+    sh: suggested.h,
+    minSide: volcengineMinSide(),
+  });
+  el.classList.remove("hidden");
+}
+
+let assetCkptPrev = "";
+
 function effectiveGenTabId(data = state.assetFull) {
   const ckpt = effectiveCheckpointForAsset(data);
   if (!ckpt) return null;
@@ -629,6 +776,7 @@ function updateCloudTabHero(data = state.assetFull) {
     mark.className = "cloud-api-mark";
     if (provider) mark.classList.add(`cloud-api-mark--${provider}`);
   }
+  updateCloudGenModeUi();
 }
 
 function currentCloudGenMode() {
@@ -637,23 +785,215 @@ function currentCloudGenMode() {
 
 function cloudGenModePayloadFromForm() {
   const mode = currentCloudGenMode();
+  const outputRaw = parseInt($("#cloud-output-count")?.value, 10);
   return {
     cloud_gen_mode: mode,
     ref_image: mode === "image_to_image" ? ($("#cloud-ref-image-path")?.value.trim() || "") : "",
     cloud_strength: parseFloat($("#cloud-strength")?.value) || 0.65,
+    cloud_output_count: Number.isFinite(outputRaw) ? Math.max(1, Math.min(15, outputRaw)) : 1,
+    cloud_ref_images_extra: $("#cloud-ref-images-extra")?.value || "",
   };
+}
+
+function currentCloudProvider(data = state.assetFull) {
+  return cloudProviderFromCheckpoint(data) || "";
+}
+
+function isVolcengineCloudProvider(data = state.assetFull) {
+  return currentCloudProvider(data) === "volcengine";
+}
+
+/** 各云厂商面板：标签 / 说明 / API 对照 / 强度滑块可见性（与 provider 实现一致） */
+const CLOUD_PROVIDER_PANEL = {
+  volcengine: {
+    modeLabel: {
+      text_to_image: "form.volcGenModeText",
+      image_to_image: "form.volcGenModeI2i",
+      image_edit: "form.volcGenModeEdit",
+    },
+    modeDesc: {
+      text_to_image: "form.volcModeTextDesc",
+      image_to_image: "form.volcModeI2iDesc",
+      image_edit: "form.volcModeEditDesc",
+    },
+    apiDetail: {
+      text_to_image: "form.volcApiDetailText",
+      image_to_image: "form.volcApiDetailI2i",
+      image_edit: "form.volcApiDetailEdit",
+    },
+    modeHint: {
+      text_to_image: "form.volcTextHint",
+      image_to_image: "form.volcI2iHint",
+      image_edit: "form.volcEditHint",
+    },
+    strengthModes: ["image_to_image", "image_edit"],
+    strengthLabel: "form.volcScale",
+    strengthHint: {
+      image_to_image: "form.volcScaleHintI2i",
+      image_edit: "form.volcScaleHintEdit",
+    },
+    refTitle: { image_to_image: "form.volcPrimaryRef" },
+    refTag: { image_to_image: "form.volcPrimaryRefTag" },
+    outputCount: true,
+    outputHint: {
+      text_to_image: "form.volcOutputCountHintText",
+      image_to_image: "form.volcOutputCountHintI2i",
+      image_edit: "form.volcOutputCountHintEdit",
+    },
+    extraRefs: true,
+    extraRefsHint: "form.volcExtraRefsHint",
+  },
+  dashscope: {
+    modeLabel: {
+      image_to_image: "form.dashscopeModeI2i",
+      image_edit: "form.dashscopeModeEdit",
+    },
+    modeDesc: {
+      text_to_image: "form.dashscopeModeTextDesc",
+      image_to_image: "form.dashscopeModeI2iDesc",
+      image_edit: "form.dashscopeModeEditDesc",
+    },
+    apiDetail: {
+      text_to_image: "form.dashscopeApiDetailText",
+      image_to_image: "form.dashscopeApiDetailI2i",
+      image_edit: "form.dashscopeApiDetailEdit",
+    },
+    modeHint: {
+      image_to_image: "form.dashscopeI2iHint",
+      image_edit: "form.dashscopeEditHint",
+    },
+    strengthModes: [],
+    refTitle: { image_to_image: "form.dashscopeRefImage" },
+    refTag: { image_to_image: "form.dashscopeRefTag" },
+    outputCount: false,
+    extraRefs: false,
+  },
+  tencent: {
+    modeLabel: {
+      image_to_image: "form.tencentModeI2i",
+      image_edit: "form.tencentModeEdit",
+    },
+    modeDesc: {
+      text_to_image: "form.tencentModeTextDesc",
+      image_to_image: "form.tencentModeI2iDesc",
+      image_edit: "form.tencentModeEditDesc",
+    },
+    apiDetail: {
+      text_to_image: "form.tencentApiDetailText",
+      image_to_image: "form.tencentApiDetailI2i",
+      image_edit: "form.tencentApiDetailEdit",
+    },
+    modeHint: {
+      image_to_image: "form.tencentI2iHint",
+      image_edit: "form.tencentEditHint",
+    },
+    strengthModes: ["image_to_image"],
+    strengthLabel: "form.tencentStrength",
+    strengthHint: { image_to_image: "form.tencentStrengthHint" },
+    refTitle: { image_to_image: "form.tencentRefImage" },
+    refTag: { image_to_image: "form.tencentRefTag" },
+    outputCount: false,
+    extraRefs: false,
+  },
+  stability: {
+    modeLabel: {
+      image_to_image: "form.stabilityModeI2i",
+      image_edit: "form.stabilityModeEdit",
+    },
+    modeDesc: {
+      text_to_image: "form.stabilityModeTextDesc",
+      image_to_image: "form.stabilityModeI2iDesc",
+      image_edit: "form.stabilityModeEditDesc",
+    },
+    apiDetail: {
+      text_to_image: "form.stabilityApiDetailText",
+      image_to_image: "form.stabilityApiDetailI2i",
+      image_edit: "form.stabilityApiDetailEdit",
+    },
+    modeHint: {
+      image_to_image: "form.stabilityI2iHint",
+      image_edit: "form.stabilityEditHint",
+    },
+    strengthModes: ["image_to_image", "image_edit"],
+    strengthLabel: "form.stabilityControlStrength",
+    strengthHint: {
+      image_to_image: "form.stabilityStrengthHintI2i",
+      image_edit: "form.stabilityStrengthHintEdit",
+    },
+    refTitle: { image_to_image: "form.stabilityRefImage" },
+    refTag: { image_to_image: "form.stabilityControlTag" },
+    outputCount: false,
+    extraRefs: false,
+  },
+};
+
+const CLOUD_MODE_FALLBACK = {
+  modeLabel: {
+    text_to_image: "form.genModeTextToImage",
+    image_to_image: "form.genModeImageToImage",
+    image_edit: "form.genModeImageEdit",
+  },
+  modeDesc: {
+    text_to_image: "form.genModeTextToImageDesc",
+    image_to_image: "form.genModeImageToImageDesc",
+    image_edit: "form.genModeImageEditDesc",
+  },
+  modeHint: {
+    image_to_image: "form.img2imgHint",
+    image_edit: "form.redrawHint",
+  },
+  strengthModes: ["image_to_image", "image_edit"],
+  strengthLabel: "form.cloudStrength",
+  strengthHint: { image_to_image: "form.cloudStrengthHint", image_edit: "form.cloudStrengthHint" },
+  refTitle: { image_to_image: "form.refImage" },
+};
+
+function cloudProviderPanel(provider) {
+  return CLOUD_PROVIDER_PANEL[provider] || null;
 }
 
 function updateCloudGenModeUi() {
   const mode = currentCloudGenMode();
+  const provider = currentCloudProvider();
+  const panelCfg = cloudProviderPanel(provider);
+  const fallback = CLOUD_MODE_FALLBACK;
+
   const panel = $("#cloud-ref-panel");
   const refSection = $("#cloud-ref-image-section");
   const editSection = $("#cloud-edit-source-section");
+  const extraRefSection = $("#cloud-ref-images-extra-section");
+  const volcOutputSection = $("#cloud-volc-output-section");
+  const apiDetail = $("#cloud-provider-api-detail");
+  const apiBody = $("#cloud-provider-api-detail-body");
+  const volcOutputHint = $("#cloud-volc-output-hint");
   const hint = $("#cloud-gen-ref-hint");
   const desc = $("#cloud-gen-mode-desc");
+  const strengthField = $("#cloud-strength-field");
+  const strengthLabel = $("#cloud-strength-label");
+  const strengthHint = $("#cloud-strength-hint");
+  const refImageTitle = $("#cloud-ref-image-title");
+  const refImageTag = $("#cloud-ref-image-tag");
+  const extraRefsHint = $("#cloud-extra-refs-hint");
+
   panel?.classList.toggle("hidden", mode === "text_to_image");
   refSection?.classList.toggle("hidden", mode !== "image_to_image");
   editSection?.classList.toggle("hidden", mode !== "image_edit");
+
+  const showExtraRefs = !!panelCfg?.extraRefs && mode === "image_to_image";
+  extraRefSection?.classList.toggle("hidden", !showExtraRefs);
+  if (extraRefsHint && panelCfg?.extraRefsHint) {
+    extraRefsHint.textContent = t(panelCfg.extraRefsHint);
+  }
+
+  volcOutputSection?.classList.toggle("hidden", !panelCfg?.outputCount);
+  apiDetail?.classList.toggle("hidden", !panelCfg?.apiDetail);
+
+  const modeLabels = panelCfg?.modeLabel || fallback.modeLabel;
+  $("#cloud-gen-mode-seg")?.querySelectorAll(".radio-seg-label[data-cloud-mode]").forEach((span) => {
+    const key = modeLabels[span.dataset.cloudMode] || fallback.modeLabel[span.dataset.cloudMode];
+    if (key) span.textContent = t(key);
+  });
+
   if (mode === "image_edit") {
     const pathEl = $("#cloud-edit-source-path");
     const inbox = state.paths?.inbox || state.assetFull?.inbox_path || "";
@@ -664,17 +1004,59 @@ function updateCloudGenModeUi() {
       pathEl.classList.toggle("is-missing", !display);
     }
   }
-  const descKey =
-    mode === "text_to_image"
-      ? "form.genModeTextToImageDesc"
-      : mode === "image_to_image"
-        ? "form.genModeImageToImageDesc"
-        : "form.genModeImageEditDesc";
-  if (desc) desc.textContent = t(descKey);
-  if (hint) {
-    hint.textContent =
-      mode === "image_edit" ? t("form.redrawHint") : mode === "image_to_image" ? t("form.img2imgHint") : "";
+
+  const refTitles = panelCfg?.refTitle || fallback.refTitle;
+  if (refImageTitle) {
+    refImageTitle.textContent = t(
+      mode === "image_to_image" ? refTitles.image_to_image || "form.refImage" : "form.refImage",
+    );
   }
+  if (refImageTag) {
+    const tagKey = mode === "image_to_image" ? panelCfg?.refTag?.image_to_image : null;
+    if (tagKey) {
+      refImageTag.textContent = t(tagKey);
+      refImageTag.classList.remove("hidden");
+    } else {
+      refImageTag.classList.add("hidden");
+    }
+  }
+
+  const strengthModes = panelCfg?.strengthModes ?? fallback.strengthModes;
+  const showStrength = strengthModes.includes(mode);
+  strengthField?.classList.toggle("hidden", !showStrength);
+  if (showStrength && strengthLabel) {
+    strengthLabel.textContent = t(panelCfg?.strengthLabel || fallback.strengthLabel);
+  }
+  if (strengthHint) {
+    if (!showStrength) {
+      strengthHint.hidden = true;
+    } else {
+      strengthHint.hidden = false;
+      const hintKey =
+        panelCfg?.strengthHint?.[mode] || fallback.strengthHint?.[mode] || "form.cloudStrengthHint";
+      strengthHint.textContent = t(hintKey);
+    }
+  }
+
+  const descMap = panelCfg?.modeDesc || fallback.modeDesc;
+  if (desc) desc.textContent = t(descMap[mode] || fallback.modeDesc[mode] || "");
+
+  if (panelCfg?.apiDetail && apiBody) {
+    const apiKey = panelCfg.apiDetail[mode];
+    apiBody.textContent = apiKey ? t(apiKey) : "";
+  }
+
+  if (panelCfg?.outputCount && volcOutputHint) {
+    const outKey = panelCfg.outputHint?.[mode];
+    volcOutputHint.textContent = outKey ? t(outKey) : "";
+  }
+
+  const hintMap = panelCfg?.modeHint || fallback.modeHint;
+  if (hint) {
+    const hintKey = hintMap[mode];
+    hint.textContent = hintKey ? t(hintKey) : "";
+  }
+  updateVolcengineSizeHint();
 }
 
 function syncCloudStrengthFromRange() {
@@ -702,7 +1084,9 @@ async function saveCloudGenModeOnly() {
     prev &&
     (prev.cloud_gen_mode || "text_to_image") === payload.cloud_gen_mode &&
     (prev.ref_image || "").trim() === payload.ref_image &&
-    (prev.cloud_strength ?? 0.65) === payload.cloud_strength
+    (prev.cloud_strength ?? 0.65) === payload.cloud_strength &&
+    (prev.cloud_output_count ?? 1) === payload.cloud_output_count &&
+    (prev.cloud_ref_images_extra || "") === payload.cloud_ref_images_extra
   ) {
     return;
   }
@@ -815,6 +1199,7 @@ async function loadBasicForm(loadSeq = assetLoadSeq) {
   });
   rebuildCheckpointSelect($("#asset-ckpt"), t("form.checkpointInherit"), data.checkpoint || "");
   updateGenerationTabsVisibility();
+  updateVolcengineSizeHint();
 }
 
 let categoryFormBaseline = null;
@@ -1006,6 +1391,9 @@ async function loadCloudTab(loadSeq = assetLoadSeq) {
   const strength = data.cloud_strength ?? data.img2img_denoise ?? 0.65;
   $("#cloud-strength").value = strength;
   $("#cloud-strength-range").value = strength;
+  const outputCount = data.cloud_output_count ?? 1;
+  if ($("#cloud-output-count")) $("#cloud-output-count").value = String(outputCount);
+  if ($("#cloud-ref-images-extra")) $("#cloud-ref-images-extra").value = data.cloud_ref_images_extra || "";
   updateCloudGenModeUi();
 }
 
@@ -1691,6 +2079,9 @@ function switchTab(tabId) {
   if (tabId === "category") loadCategoryForm();
   if (tabId === "comfyui") loadComfyUiTab();
   if (tabId.startsWith("cloud-")) loadCloudTab();
+  if (tabId === "cloud-volcengine" && state.assetId) {
+    void maybePromptVolcengineSizeUpdate({ trigger: "tab" });
+  }
   if (tabId === "settings") loadSettingsForm();
   if (tabId === "ai") openAiPanel();
 }
@@ -1807,11 +2198,71 @@ function hidePreviewLoadingUi() {
   stage?.classList.remove("is-loading");
 }
 
+function showLiveGenPreview(rev) {
+  const nextRev = parseInt(rev, 10) || 0;
+  if (!nextRev || nextRev === livePreviewRev) return;
+  livePreviewRev = nextRev;
+  const img = $("#preview-img");
+  const ph = $("#preview-ph");
+  const loading = $("#preview-loading");
+  const stage = $("#preview-stage");
+  const liveBadge = $("#preview-live-badge");
+  const zoomBadge = $("#preview-zoom-label");
+  if (!img || !stage) return;
+  if (ph) ph.hidden = true;
+  if (loading) {
+    loading.hidden = true;
+    loading.setAttribute("aria-hidden", "true");
+  }
+  if (zoomBadge) zoomBadge.hidden = true;
+  if (liveBadge) {
+    liveBadge.textContent = t("preview.liveGen");
+    liveBadge.hidden = false;
+    liveBadge.classList.remove("hidden");
+  }
+  stage.classList.remove("is-loading");
+  stage.classList.add("has-image", "is-live-preview");
+  img.hidden = false;
+  img.onload = () => {
+    previewView.imgW = img.naturalWidth || 1;
+    previewView.imgH = img.naturalHeight || 1;
+    layoutPreviewImage();
+  };
+  img.src = `/api/jobs/live-preview?rev=${nextRev}&_=${Date.now()}`;
+}
+
+function clearLiveGenPreview({ reload = true } = {}) {
+  const stage = $("#preview-stage");
+  const hadLive = livePreviewRev > 0 || stage?.classList.contains("is-live-preview");
+  livePreviewRev = 0;
+  const liveBadge = $("#preview-live-badge");
+  stage?.classList.remove("is-live-preview");
+  if (liveBadge) {
+    liveBadge.hidden = true;
+    liveBadge.classList.add("hidden");
+  }
+  if (hadLive && reload && state.assetId) void loadPreview();
+}
+
+function maybeUpdateLivePreview(p) {
+  if (!p?.preview_available || !p?.preview_rev) return;
+  if (jobProg.lastApiKind && jobProg.lastApiKind !== "generate") return;
+  showLiveGenPreview(p.preview_rev);
+}
+
 async function applyPreviewBlob(reqId, asset, blob) {
   const img = $("#preview-img");
   const stage = $("#preview-stage");
   const badge = $("#preview-zoom-label");
+  const liveBadge = $("#preview-live-badge");
   if (!img || reqId !== state.previewReq) return;
+
+  livePreviewRev = 0;
+  stage?.classList.remove("is-live-preview");
+  if (liveBadge) {
+    liveBadge.hidden = true;
+    liveBadge.classList.add("hidden");
+  }
 
   revokePreviewBlob();
   resetPreviewView();
@@ -2308,6 +2759,7 @@ async function loadGenerationModels() {
     const data = await API.get("/api/generation/models");
     state.checkpoints = data.local?.checkpoints || [];
     state.cloudModels = data.cloud?.models || [];
+    state.cloudProviders = data.cloud?.providers || {};
     fillCheckpointSelects();
     updateGenerationTabLabels();
   } catch {
@@ -2320,6 +2772,7 @@ async function loadGenerationModels() {
     try {
       const cloud = await API.get("/api/cloud/models");
       state.cloudModels = cloud.models || [];
+      state.cloudProviders = cloud.providers || {};
     } catch {
       state.cloudModels = [];
     }
@@ -2402,6 +2855,7 @@ function stopJobPoll() {
 
 function markJobSubmitting(kind, assetIds) {
   stopJobPoll();
+  clearLiveGenPreview({ reload: false });
   state.jobTrack.active = true;
   state.jobTrack.sawBusy = false;
   state.jobTrack.postOk = false;
@@ -2452,6 +2906,7 @@ function finishJobUi({ quickFail = false, cloudFailures = null } = {}) {
   stopJobPoll();
   resetJobTracking();
   hideJobFloat();
+  clearLiveGenPreview({ reload: wasGenerate });
   const pill = $("#job-pill");
   if (pill) {
     pill.textContent = t("job.ready");
@@ -2555,10 +3010,11 @@ function ingestJobProgress(p) {
   } else if (kind === "running") {
     if (p.message) jobProg.message = p.message;
     const elapsed = parseInt(p.elapsed, 10) || 0;
+    const expected = Math.max(parseInt(p.expected_s, 10) || 240, 60);
     if (elapsed > 0) {
       jobProg.stepPct = Math.max(
         jobProg.stepPct,
-        Math.min(92, Math.floor((elapsed / 90) * 88) + 4),
+        Math.min(92, Math.floor((elapsed / expected) * 88) + 4),
       );
     } else {
       jobProg.stepPct = Math.max(jobProg.stepPct, 12);
@@ -2568,6 +3024,9 @@ function ingestJobProgress(p) {
     if (kind === "executing") {
       jobProg.stepPct = Math.max(jobProg.stepPct, 20);
     }
+  }
+  if (p.preview_available && p.preview_rev) {
+    maybeUpdateLivePreview(p);
   }
 }
 
@@ -2945,7 +3404,8 @@ async function refreshComfy() {
     const ok = !!data.ok;
     pill.textContent = ok ? t("comfy.online") : t("comfy.offline");
     pill.classList.toggle("ok", ok);
-    pill.title = data.message || "";
+    const hint = data.live_preview_hint ? `\n${data.live_preview_hint}` : "";
+    pill.title = `${data.message || ""}${hint}`.trim();
     comfyOnlineLast = ok;
     if (ok && (wasOnline === false || (wasOnline === null && !(state.checkpoints?.length)))) {
       void loadGenerationModels();
@@ -3029,6 +3489,19 @@ async function saveBasic(e) {
       remove_bg_mode: form.querySelector('input[name="remove_bg_mode"]:checked')?.value || "inherit",
       checkpoint: $("#asset-ckpt")?.value || "",
     };
+    const effCkpt =
+      body.checkpoint ||
+      state.categories.find((c) => c.id === body.category)?.checkpoint ||
+      "";
+    if (
+      cloudProviderFromCheckpoint(effCkpt) === "volcengine" &&
+      assetNeedsVolcengineSizeBump(body.width, body.height)
+    ) {
+      const ok = await maybePromptVolcengineSizeUpdate({ trigger: "save" });
+      if (!ok) return;
+      body.width = parseInt(form.width.value, 10);
+      body.height = parseInt(form.height.value, 10);
+    }
     state.assetFull = await API.put(`/api/assets/${state.assetId}`, body);
     toast(t("toast.saved"));
     updateGenerationTabsVisibility();
@@ -4666,6 +5139,39 @@ function importAssetTargetName(file) {
   return `${stem}.png`;
 }
 
+function findImportNameConflicts() {
+  const seen = new Map();
+  for (const item of importDraftFiles) {
+    const name = importAssetTargetName(item.file);
+    const existing = state.assets.find((a) => a.filename === name);
+    if (existing && !seen.has(existing.id)) seen.set(existing.id, existing);
+  }
+  return [...seen.values()];
+}
+
+async function confirmImportReplace(conflicts) {
+  if (!conflicts.length) return true;
+  const names = conflicts.map((a) => a.filename).join("、");
+  return showConfirmDialog({
+    title: t("confirm.importReplace.title"),
+    message: t("confirm.importReplace.message", { names, n: conflicts.length }),
+    details: [
+      t("confirm.importReplace.detailTrash"),
+      ...conflicts.map((a) => t("confirm.importReplace.detailItem", { name: a.filename, id: a.id })),
+    ],
+    confirmText: t("confirm.importReplace.confirm"),
+    cancelText: t("confirm.importReplace.cancel"),
+    danger: true,
+  });
+}
+
+function cancelImportDialog(dlg) {
+  dlg?.close();
+  resetImportDraft();
+  switchNewAssetDlgTab("manual");
+  setFormError($("#form-new-asset"), "");
+}
+
 function resetImportDraft() {
   for (const item of importDraftFiles) {
     if (item.url) URL.revokeObjectURL(item.url);
@@ -4887,11 +5393,19 @@ async function newAssetDialog() {
         toast(msg, { variant: "error" });
         return;
       }
+      const conflicts = findImportNameConflicts();
+      if (!(await confirmImportReplace(conflicts))) {
+        cancelImportDialog(dlg);
+        return;
+      }
       await withBtnBusy(submitBtn, async () => {
         try {
           const fd = new FormData();
           fd.append("category", state.categoryId);
           fd.append("gen_mode", currentImportGenMode());
+          if (conflicts.length) {
+            fd.append("replace_asset_ids", conflicts.map((a) => a.id).join(","));
+          }
           for (const item of importDraftFiles) {
             fd.append("files", item.file, item.file.name);
           }
@@ -4902,6 +5416,10 @@ async function newAssetDialog() {
           updateMainTabsVisibility();
           const created = result?.created || [];
           const failed = result?.failed || [];
+          const trashed = result?.trashed || [];
+          if (trashed.length) {
+            toast(t("toast.importReplacedTrash", { n: trashed.length }));
+          }
           if (failed.length) {
             toast(
               t("toast.assetsImportedPartial", {
@@ -5107,6 +5625,20 @@ function bindUi() {
   if (isAiIntroDismissed()) $("#ai-intro-section")?.classList.add("is-hidden");
 
   $("#form-basic")?.addEventListener("submit", saveBasic);
+  const assetCkptSel = $("#asset-ckpt");
+  assetCkptSel?.addEventListener("focus", () => {
+    assetCkptPrev = assetCkptSel.value || "";
+  });
+  assetCkptSel?.addEventListener("change", () => {
+    const ckpt = resolveEffectiveCheckpointFromUi();
+    if (cloudProviderFromCheckpoint(ckpt) !== "volcengine") {
+      updateVolcengineSizeHint();
+      return;
+    }
+    void maybePromptVolcengineSizeUpdate({ trigger: "checkpoint", revertOnCancel: true });
+  });
+  $("#form-basic input[name=width]")?.addEventListener("input", updateVolcengineSizeHint);
+  $("#form-basic input[name=height]")?.addEventListener("input", updateVolcengineSizeHint);
   $("#form-category")?.addEventListener("submit", saveCategory);
   $("#form-settings")?.addEventListener("submit", saveSettings);
   bindCloudApiFieldListeners();
@@ -5128,6 +5660,12 @@ function bindUi() {
   });
   $("#cloud-strength")?.addEventListener("change", () => {
     syncCloudStrengthFromNumber();
+    void saveCloudGenModeOnly();
+  });
+  $("#cloud-output-count")?.addEventListener("change", () => {
+    void saveCloudGenModeOnly();
+  });
+  $("#cloud-ref-images-extra")?.addEventListener("change", () => {
     void saveCloudGenModeOnly();
   });
   $("#img2img-denoise-range")?.addEventListener("input", () => {

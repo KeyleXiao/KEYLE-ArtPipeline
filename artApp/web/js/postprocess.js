@@ -196,6 +196,8 @@ let cropLoadSeq = 0;
 let cropRawBlobEpoch = 0;
 /** @type {Map<string, { epoch: number, blob: Blob }>} */
 const cropRawBlobCache = new Map();
+/** @type {Map<string, Promise<Blob>>} */
+const cropRawBlobInflight = new Map();
 /** @type {AbortController | null} */
 let cropLayerFetchAbort = null;
 /** @type {{ data: Uint8ClampedArray, w: number, h: number, layerId: string } | null} */
@@ -595,13 +597,18 @@ function setStackCanvasSize(w, h) {
   return { w: cw, h: ch };
 }
 
+/** @type {{ w: number, h: number }} */
+let canvasResizeBaseline = { w: 512, h: 512 };
+/** @type {object | null} */
+let canvasResizeSnapshot = null;
+
 function isCanvasSizeField(el) {
-  return el?.id === "pp-canvas-w" || el?.id === "pp-canvas-h";
+  return el?.id === "pp-resize-w" || el?.id === "pp-resize-h";
 }
 
 function ensureCanvasSizeInputsEnabled() {
-  const wIn = $("#pp-canvas-w");
-  const hIn = $("#pp-canvas-h");
+  const wIn = $("#pp-resize-w");
+  const hIn = $("#pp-resize-h");
   for (const el of [wIn, hIn]) {
     if (!el) continue;
     el.disabled = false;
@@ -617,62 +624,160 @@ function parseCanvasFieldValue(raw) {
   return n;
 }
 
-function fillCanvasSizeInputs() {
-  const panel = $("#pp-canvas-size-panel");
-  const wIn = $("#pp-canvas-w");
-  const hIn = $("#pp-canvas-h");
-  if (!panel || !wIn || !hIn) return;
+function resetCanvasResizeSession() {
+  const { w, h } = canvasSize();
+  canvasResizeBaseline = { w, h };
+  canvasResizeSnapshot = cloneStackData(stack);
+  fillCanvasResizeInputs();
+  updateCanvasSizeCompareUI();
+}
+
+function updateCanvasSizeCompareUI() {
+  const cur = $("#pp-canvas-size-current");
+  const tgt = $("#pp-canvas-size-target");
+  if (cur) cur.textContent = `${canvasResizeBaseline.w} × ${canvasResizeBaseline.h}`;
+  if (!tgt) return;
+  const draft = readCanvasResizeInputs({ commit: false });
+  if (draft) {
+    tgt.textContent = `${draft.w} × ${draft.h}`;
+    return;
+  }
+  tgt.textContent = `${canvasResizeBaseline.w} × ${canvasResizeBaseline.h}`;
+}
+
+function fillCanvasResizeInputs() {
+  const wIn = $("#pp-resize-w");
+  const hIn = $("#pp-resize-h");
+  if (!wIn || !hIn) return;
   if (document.activeElement === wIn || document.activeElement === hIn) return;
   const { w, h } = canvasSize();
   wIn.value = String(w);
   hIn.value = String(h);
   ensureCanvasSizeInputsEnabled();
+  updateCanvasSizeCompareUI();
 }
 
-function readCanvasSizeInputs({ commit = true } = {}) {
-  const wIn = $("#pp-canvas-w");
-  const hIn = $("#pp-canvas-h");
+function readCanvasResizeInputs({ commit = true } = {}) {
+  const wIn = $("#pp-resize-w");
+  const hIn = $("#pp-resize-h");
   if (!wIn || !hIn) return null;
   const rawW = parseCanvasFieldValue(wIn.value);
   const rawH = parseCanvasFieldValue(hIn.value);
-  if (!commit) {
-    if (rawW == null || rawH == null) return null;
-    return { w: rawW, h: rawH };
-  }
   if (rawW == null || rawH == null) return null;
+  if (!commit) return { w: rawW, h: rawH };
   return setStackCanvasSize(rawW, rawH);
 }
 
-function bindCanvasSizeControls() {
-  const wIn = $("#pp-canvas-w");
-  const hIn = $("#pp-canvas-h");
+function ensureCanvasResizeSnapshot() {
+  if (!canvasResizeSnapshot && stack) {
+    canvasResizeSnapshot = cloneStackData(stack);
+  }
+}
+
+function resizeStackCanvasData(stackObj, newW, newH, { scaleContent = false } = {}) {
+  if (!stackObj) return false;
+  const oldW = stackObj.canvas_width || stackObj.canvas?.width || 512;
+  const oldH = stackObj.canvas_height || stackObj.canvas?.height || 512;
+  const nw = clampCanvasDim(newW, oldW);
+  const nh = clampCanvasDim(newH, oldH);
+  if (nw === oldW && nh === oldH && !scaleContent) return false;
+
+  if (scaleContent && oldW > 0 && oldH > 0 && (nw !== oldW || nh !== oldH)) {
+    const sx = nw / oldW;
+    const sy = nh / oldH;
+    const contentScale = Math.min(sx, sy);
+    for (const layer of stackObj.layers || []) {
+      if (!layer?.transform) continue;
+      layer.transform.offset_x = (layer.transform.offset_x || 0) * sx;
+      layer.transform.offset_y = (layer.transform.offset_y || 0) * sy;
+      layer.transform.scale = (layer.transform.scale || 1) * contentScale;
+      if (layer.type === "text" && layer.text) {
+        layer.text.font_size = Math.max(8, Math.round((layer.text.font_size || 24) * contentScale));
+      }
+    }
+  }
+
+  stackObj.canvas_width = nw;
+  stackObj.canvas_height = nh;
+  stackObj.canvas = { width: nw, height: nh };
+  return nw !== oldW || nh !== oldH || scaleContent;
+}
+
+function applyCanvasResizePreview() {
+  const draft = readCanvasResizeInputs({ commit: false });
+  if (!draft || !stack) return false;
+  ensureCanvasResizeSnapshot();
+  if (!canvasResizeSnapshot) return false;
+
+  const scaleContent = !!$("#pp-resize-scale-content")?.checked;
+  const targetW = clampCanvasDim(draft.w, canvasResizeBaseline.w);
+  const targetH = clampCanvasDim(draft.h, canvasResizeBaseline.h);
+  const baseW = canvasResizeBaseline.w;
+  const baseH = canvasResizeBaseline.h;
+
+  for (const layer of stack.layers || []) {
+    const baseLayer = (canvasResizeSnapshot.layers || []).find((l) => l.id === layer.id);
+    if (!layer?.transform || !baseLayer?.transform) continue;
+    if (scaleContent && baseW > 0 && baseH > 0) {
+      const sx = targetW / baseW;
+      const sy = targetH / baseH;
+      const contentScale = Math.min(sx, sy);
+      layer.transform.offset_x = (baseLayer.transform.offset_x || 0) * sx;
+      layer.transform.offset_y = (baseLayer.transform.offset_y || 0) * sy;
+      layer.transform.scale = (baseLayer.transform.scale || 1) * contentScale;
+      if (layer.type === "text" && layer.text) {
+        const baseSize = baseLayer.text?.font_size || layer.text.font_size || 24;
+        layer.text.font_size = Math.max(8, Math.round(baseSize * contentScale));
+      }
+    } else {
+      layer.transform.offset_x = baseLayer.transform.offset_x || 0;
+      layer.transform.offset_y = baseLayer.transform.offset_y || 0;
+      layer.transform.scale = baseLayer.transform.scale || 1;
+      if (layer.type === "text" && layer.text && baseLayer.text?.font_size != null) {
+        layer.text.font_size = baseLayer.text.font_size;
+      }
+    }
+  }
+
+  stack.canvas_width = targetW;
+  stack.canvas_height = targetH;
+  stack.canvas = { width: targetW, height: targetH };
+  syncBoundsCanvasFromStack();
+  updateCanvasSizeCompareUI();
+  updatePostprocessMeta();
+  scheduleStackPersist({ structural: true });
+  schedulePreview(120);
+  return true;
+}
+
+function commitCanvasResizeFromInputs() {
+  const draft = readCanvasResizeInputs({ commit: false });
+  if (!draft) throw new Error(t("pp.canvasSizeInvalid"));
+  if (
+    draft.w < 32 ||
+    draft.w > 4096 ||
+    draft.h < 32 ||
+    draft.h > 4096
+  ) {
+    throw new Error(t("pp.canvasSizeInvalid"));
+  }
+  applyCanvasResizePreview();
+  resetCanvasResizeSession();
+}
+
+function bindCanvasResizeControls() {
+  const wIn = $("#pp-resize-w");
+  const hIn = $("#pp-resize-h");
+  const scaleChk = $("#pp-resize-scale-content");
+  const resetBtn = $("#pp-resize-reset");
+  const acc = $("#pp-acc-canvas-size");
   if (!wIn || !hIn) return;
   ensureCanvasSizeInputsEnabled();
 
   let canvasHistTimer = null;
   let previewDebounce = null;
 
-  const commitCanvasFromInputs = () => {
-    const parsed = readCanvasSizeInputs({ commit: true });
-    if (!parsed) return false;
-    updatePostprocessMeta();
-    schedulePreview(120);
-    return true;
-  };
-
-  const onCanvasInput = () => {
-    const draft = readCanvasSizeInputs({ commit: false });
-    if (draft) {
-      stack.canvas_width = draft.w;
-      stack.canvas_height = draft.h;
-      stack.canvas = { width: draft.w, height: draft.h };
-      updatePostprocessMeta();
-    }
-    clearTimeout(previewDebounce);
-    previewDebounce = setTimeout(() => {
-      previewDebounce = null;
-      if (readCanvasSizeInputs({ commit: false })) schedulePreview(160);
-    }, 280);
+  const queueCanvasResizeHistory = () => {
     if (canvasHistTimer) clearTimeout(canvasHistTimer);
     canvasHistTimer = setTimeout(() => {
       canvasHistTimer = null;
@@ -680,18 +785,46 @@ function bindCanvasSizeControls() {
     }, 500);
   };
 
-  const onCanvasCommit = () => {
-    if (!commitCanvasFromInputs()) {
-      fillCanvasSizeInputs();
-    }
+  const onResizeInput = () => {
+    updateCanvasSizeCompareUI();
+    clearTimeout(previewDebounce);
+    previewDebounce = setTimeout(() => {
+      previewDebounce = null;
+      applyCanvasResizePreview();
+      queueCanvasResizeHistory();
+    }, 280);
+  };
+
+  const onResizeCommit = () => {
+    clearTimeout(previewDebounce);
+    previewDebounce = null;
+    if (!applyCanvasResizePreview()) fillCanvasResizeInputs();
+    else queueCanvasResizeHistory();
   };
 
   for (const el of [wIn, hIn]) {
-    el.addEventListener("input", onCanvasInput);
-    el.addEventListener("change", onCanvasCommit);
+    el.addEventListener("input", onResizeInput);
+    el.addEventListener("change", onResizeCommit);
     el.addEventListener("keydown", (e) => e.stopPropagation());
     el.addEventListener("wheel", (e) => e.stopPropagation(), { passive: true });
   }
+
+  scaleChk?.addEventListener("change", () => {
+    applyCanvasResizePreview();
+    queueCanvasResizeHistory();
+  });
+
+  resetBtn?.addEventListener("click", () => {
+    resetCanvasResizeSession();
+    applyCanvasResizePreview();
+    setStatus(t("pp.canvasSizeResetDone"));
+  });
+
+  acc?.addEventListener("toggle", () => {
+    if (acc.open) resetCanvasResizeSession();
+  });
+
+  resetCanvasResizeSession();
 }
 
 function previewBody(extra = {}) {
@@ -810,6 +943,9 @@ async function persistStackQuietly() {
 function markStackStructuralChange() {
   scheduleStackPersist({ structural: true });
   updatePostprocessMeta();
+  if (stack && !isCanvasSizeField(document.activeElement)) {
+    resetCanvasResizeSession();
+  }
 }
 
 function defaultTextStyle() {
@@ -2109,7 +2245,7 @@ function syncPreviewAfterApply(result = {}) {
     assetInfo.width = result.width;
     assetInfo.height = result.height;
     if (result.size_label) assetInfo.size_label = result.size_label;
-    fillCanvasSizeInputs();
+    fillCanvasResizeInputs();
     updatePostprocessMeta();
   }
   syncViewportToDocument();
@@ -2537,6 +2673,20 @@ function cropLog(msg, kind = "系统") {
   appendLog({ ts: new Date().toLocaleTimeString(), kind, msg: `[裁切] ${msg}` });
 }
 
+function cropLoadDiag(label, extra = {}) {
+  const parts = [
+    `loadSeq=${extra.loadSeq ?? "?"}`,
+    `cropLoadSeq=${cropLoadSeq}`,
+    `cropMode=${cropMode}`,
+    `cropLoading=${cropLoading}`,
+    `cropEntering=${cropEntering}`,
+    `cropSubModeLoading=${cropSubModeLoading}`,
+    `rawImg=${!!cropRawImg}`,
+    `epoch=${cropRawBlobEpoch}`,
+  ];
+  cropLog(`${label} · ${parts.join(" · ")}`, "系统");
+}
+
 function withTimeout(promise, ms, message) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(message)), ms);
@@ -2557,41 +2707,62 @@ async function blobToImageBitmap(blob, timeoutMs = 30000) {
   if (!blob || blob.size < 8) throw new Error(t("pp.noPreviewFile"));
 
   const decodeViaImage = () =>
-    new Promise((resolve, reject) => {
-      const img = new Image();
-      const url = URL.createObjectURL(blob);
-      img.onload = () => {
-        URL.revokeObjectURL(url);
-        resolve(img);
-      };
-      img.onerror = () => {
-        URL.revokeObjectURL(url);
-        reject(new Error(t("pp.noPreviewFile")));
-      };
-      img.src = url;
-    });
+    withTimeout(
+      new Promise((resolve, reject) => {
+        const img = new Image();
+        const url = URL.createObjectURL(blob);
+        img.onload = () => {
+          URL.revokeObjectURL(url);
+          resolve(img);
+        };
+        img.onerror = () => {
+          URL.revokeObjectURL(url);
+          reject(new Error(t("pp.noPreviewFile")));
+        };
+        img.src = url;
+      }),
+      timeoutMs,
+      t("pp.cropTimeout"),
+    );
+
+  cropLog(`解码图层 PNG (${blob.size} bytes, type=${blob.type || "?"})…`, "系统");
 
   if (typeof createImageBitmap !== "function") {
-    return decodeViaImage();
+    const img = await decodeViaImage();
+    cropLog(`Image 解码完成 ${img.width}×${img.height}`, "系统");
+    return img;
   }
 
   try {
-    return await withTimeout(createImageBitmap(blob), timeoutMs, t("pp.cropTimeout"));
+    const bmp = await withTimeout(createImageBitmap(blob), timeoutMs, t("pp.cropTimeout"));
+    cropLog(`createImageBitmap 完成 ${bmp.width}×${bmp.height}`, "系统");
+    return bmp;
   } catch (err) {
     cropLog(`createImageBitmap 失败，回退 Image 解码: ${err.message}`, "系统");
-    return decodeViaImage();
+    const img = await decodeViaImage();
+    cropLog(`Image 回退解码完成 ${img.width}×${img.height}`, "系统");
+    return img;
   }
 }
 
-function abortCropEnterIfStale(loadSeq) {
+function abortCropEnterIfStale(loadSeq, reason = "") {
   if (loadSeq === cropLoadSeq && cropMode) return false;
-  cropLog("进入裁切：加载已取消（用户退出或新请求）", "系统");
+  const suffix = reason ? ` (${reason})` : "";
+  cropLog(`进入裁切：加载已取消${suffix}`, "系统");
+  cropLoadDiag("取消时状态", { loadSeq });
   if (loadSeq === cropLoadSeq) {
     cropLoading = false;
     cropEntering = false;
     updateCropModeUi();
   }
   return true;
+}
+
+function clearCropEnterLoading(loadSeq, reason = "") {
+  if (loadSeq != null && loadSeq !== cropLoadSeq) return;
+  cropLoading = false;
+  if (reason) cropLog(reason, "系统");
+  updateCropModeUi();
 }
 
 function setCropPanelMessage(msg) {
@@ -2672,6 +2843,8 @@ function requestCropMode() {
 function invalidateCropLayerCache(layerId) {
   cropRawBlobEpoch += 1;
   cropRawBlobCache.clear();
+  cropRawBlobInflight.clear();
+  cropLog(`图层 PNG 缓存失效: layer=${layerId || "?"} epoch=${cropRawBlobEpoch}`, "系统");
   if (!layerId) return;
   if (matteFullState.layerId !== layerId || !matteFullState.data) return;
   invalidateMatteFull();
@@ -2687,6 +2860,8 @@ function invalidateCropLayerCache(layerId) {
 async function matteFetchRawBlob(layerId, { skipFormSync = false, signal } = {}) {
   if (!skipFormSync) applyPropsFromForm();
   const body = previewBody({ layer_id: layerId });
+  const t0 = performance.now();
+  cropLog(`请求 layer-raw: layer=${layerId}`, "系统");
   try {
     const res = await fetch(`/api/assets/${encodeURIComponent(assetId)}/postprocess/layer-raw`, {
       method: "POST",
@@ -2697,13 +2872,21 @@ async function matteFetchRawBlob(layerId, { skipFormSync = false, signal } = {})
     });
     if (!res.ok) {
       const detail = (await res.text()).slice(0, 200) || res.statusText;
-      matteLog(`layer-raw 失败 (${res.status}): ${detail}`, "系统");
+      cropLog(`layer-raw 失败 (${res.status}): ${detail}`, "系统");
       throw new Error(`${t("pp.noPreviewFile")} (${res.status}: ${detail})`);
     }
-    return await res.blob();
+    const blob = await res.blob();
+    cropLog(
+      `layer-raw 完成: ${blob.size} bytes (${Math.round(performance.now() - t0)}ms)`,
+      "系统",
+    );
+    return blob;
   } catch (err) {
-    if (err?.name === "AbortError") throw err;
-    matteLog(`layer-raw 异常: ${err.message}`, "系统");
+    if (err?.name === "AbortError") {
+      cropLog(`layer-raw 已中止 (${Math.round(performance.now() - t0)}ms)`, "系统");
+      throw err;
+    }
+    cropLog(`layer-raw 异常 (${Math.round(performance.now() - t0)}ms): ${err.message}`, "系统");
     throw err instanceof Error ? err : new Error(String(err));
   }
 }
@@ -3554,28 +3737,43 @@ function bindEscapeHandler() {
 
 async function fetchCropLayerBlob(layer, { signal } = {}) {
   const reqEpoch = cropRawBlobEpoch;
-  if (isSubjectLayer(layer)) {
-    const res = await fetch(
-      `/api/assets/${encodeURIComponent(assetId)}/postprocess/subject-raw.png?subject=${encodeURIComponent(subjectMode || "inbox")}&v=${cropRawBlobEpoch}`,
-      { cache: "no-store", signal },
-    );
-    if (!res.ok) {
-      const detail = (await res.text()).slice(0, 120) || res.statusText;
-      throw new Error(`${t("pp.noPreviewFile")} (${res.status}: ${detail})`);
-    }
-    const blob = await res.blob();
-    if (!blob || blob.size < 8) throw new Error(t("pp.noPreviewFile"));
-    return blob;
-  }
   const id = layer.id;
   const cached = cropRawBlobCache.get(id);
-  if (cached && cached.epoch === cropRawBlobEpoch) return cached.blob;
-  const blob = await matteFetchRawBlob(id, { skipFormSync: true, signal });
-  if (!blob || blob.size < 8) throw new Error(t("pp.noPreviewFile"));
-  if (reqEpoch === cropRawBlobEpoch) {
-    cropRawBlobCache.set(id, { epoch: cropRawBlobEpoch, blob });
+  if (cached && cached.epoch === cropRawBlobEpoch) {
+    cropLog(`命中图层缓存: ${id} (${cached.blob.size} bytes)`, "系统");
+    return cached.blob;
   }
-  return blob;
+
+  const inflightKey = `${id}:${cropRawBlobEpoch}`;
+  const pending = cropRawBlobInflight.get(inflightKey);
+  if (pending) {
+    cropLog(`复用进行中的图层请求: ${layer.name || id} · epoch=${reqEpoch}`, "系统");
+    return pending;
+  }
+
+  const task = (async () => {
+    const t0 = performance.now();
+    cropLog(
+      `拉取裁切图层: ${layer.name || id} · layer-raw · epoch=${reqEpoch} · subject=${isSubjectLayer(layer)}`,
+      "系统",
+    );
+    try {
+      const blob = await matteFetchRawBlob(id, { skipFormSync: true, signal });
+      if (!blob || blob.size < 8) throw new Error(t("pp.noPreviewFile"));
+      if (reqEpoch === cropRawBlobEpoch) {
+        cropRawBlobCache.set(id, { epoch: cropRawBlobEpoch, blob });
+      }
+      cropLog(`layer-raw 总耗时 ${Math.round(performance.now() - t0)}ms`, "系统");
+      return blob;
+    } finally {
+      if (cropRawBlobInflight.get(inflightKey) === task) {
+        cropRawBlobInflight.delete(inflightKey);
+      }
+    }
+  })();
+
+  cropRawBlobInflight.set(inflightKey, task);
+  return task;
 }
 
 async function loadCropRgbaWork(layer) {
@@ -4002,6 +4200,7 @@ async function switchCropSubModeAsync(mode) {
   if (!layer || layer.type !== "image") return;
   if (mode === cropSubMode && !cropSubModeLoading) return;
   cropSubModeLoading = true;
+  cropLog(`切换裁切子模式 → ${mode}`, "操作");
   drawCropCanvas();
   try {
     if (mode === "rect") {
@@ -4010,6 +4209,7 @@ async function switchCropSubModeAsync(mode) {
       } catch (err) {
         cropLog(`矩形裁切加载失败: ${err.message}`, "系统");
         setStatus(err.message);
+        drawCropErrorCanvas(err.message);
         return;
       }
     } else if (mode === "matrix") {
@@ -4081,15 +4281,37 @@ async function ensureMatrixWork(layer) {
 }
 
 async function loadRectCropWork(layer, { signal, loadSeq } = {}) {
-  const blob = await withTimeout(
-    fetchCropLayerBlob(layer, { signal }),
-    60000,
-    t("pp.cropTimeout"),
-  );
-  if (loadSeq != null && abortCropEnterIfStale(loadSeq)) return;
+  const t0 = performance.now();
+  cropLog(`loadRectCropWork 开始: ${layer.name || layer.id}`, "系统");
+  let blob;
+  try {
+    blob = await withTimeout(
+      fetchCropLayerBlob(layer, { signal }),
+      60000,
+      t("pp.cropTimeout"),
+    );
+  } catch (err) {
+    cropLog(
+      `拉取图层 PNG 失败 (${Math.round(performance.now() - t0)}ms): ${err?.message || err}`,
+      "系统",
+    );
+    throw err;
+  }
+  cropLog(`PNG 已就绪 (${Math.round(performance.now() - t0)}ms, ${blob.size} bytes)`, "系统");
+  if (loadSeq != null && abortCropEnterIfStale(loadSeq, "PNG 后")) return;
+
   if (cropRawImg) cropRawImg.close?.();
-  const bitmap = await blobToImageBitmap(blob);
-  if (loadSeq != null && abortCropEnterIfStale(loadSeq)) {
+  let bitmap;
+  try {
+    bitmap = await blobToImageBitmap(blob);
+  } catch (err) {
+    cropLog(
+      `解码 PNG 失败 (${Math.round(performance.now() - t0)}ms): ${err?.message || err}`,
+      "系统",
+    );
+    throw err;
+  }
+  if (loadSeq != null && abortCropEnterIfStale(loadSeq, "解码后")) {
     bitmap.close?.();
     return;
   }
@@ -4102,6 +4324,10 @@ async function loadRectCropWork(layer, { signal, loadSeq } = {}) {
   } else {
     cropPreview = null;
   }
+  cropLog(
+    `loadRectCropWork 完成 ${cropRawSize.w}×${cropRawSize.h} (${Math.round(performance.now() - t0)}ms)`,
+    "系统",
+  );
 }
 
 function openCropPropsPanel() {
@@ -4176,24 +4402,34 @@ async function enterCropMode() {
   const stitch = $("#pp-matrix-auto-stitch");
   if (stitch) stitch.checked = true;
   setStatus(t("pp.cropLoading"));
-  cropLog(`进入裁切: ${layer.name || layer.id}`, "操作");
+  cropLog(`进入裁切: ${layer.name || layer.id} · subject=${isSubjectLayer(layer)}`, "操作");
+  cropLoadDiag("enterCropMode 开始", { loadSeq });
 
   cropLayerFetchAbort?.abort();
   const loadAbort = new AbortController();
   cropLayerFetchAbort = loadAbort;
 
   const t0 = performance.now();
+  const loadWatchdog = setTimeout(() => {
+    if (loadSeq !== cropLoadSeq || !cropLoading) return;
+    cropLoadDiag("加载超过 8s 仍在进行", { loadSeq });
+  }, 8000);
+
   try {
     if (matteMode || matteStrokeActive) {
+      cropLog("进入裁切前先退出抠图模式", "系统");
       await exitMatteMode({ skipPreviewRefresh: true });
-      if (abortCropEnterIfStale(loadSeq)) return;
+      if (abortCropEnterIfStale(loadSeq, "退出抠图后")) return;
       setStatus(t("pp.cropLoading"));
       setCropPanelMessage(t("pp.cropLoading"));
       drawCropLoadingCanvas();
     }
-    if (abortCropEnterIfStale(loadSeq)) return;
+    if (abortCropEnterIfStale(loadSeq, "加载前")) return;
     await loadRectCropWork(layer, { signal: loadAbort.signal, loadSeq });
-    if (abortCropEnterIfStale(loadSeq)) return;
+    if (abortCropEnterIfStale(loadSeq, "loadRectCropWork 后")) return;
+    if (!cropRawImg) {
+      throw new Error(t("pp.noPreviewFile"));
+    }
     cropLoading = false;
     updateCropModeUi();
     scheduleCropCanvasLayout();
@@ -4206,18 +4442,29 @@ async function enterCropMode() {
       isSubjectLayer(layer) ? t("pp.cropModeEnterSubject") : t("pp.cropModeEnter"),
     );
   } catch (err) {
-    if (err?.name === "AbortError" || abortCropEnterIfStale(loadSeq)) return;
+    if (err?.name === "AbortError") {
+      cropLog(`进入裁切已中止 (${Math.round(performance.now() - t0)}ms)`, "系统");
+      clearCropEnterLoading(loadSeq, "AbortError 清理 cropLoading");
+      if (abortCropEnterIfStale(loadSeq, "AbortError")) return;
+      return;
+    }
+    if (abortCropEnterIfStale(loadSeq, "catch 前")) return;
     cropLoading = false;
     const msg = err?.message || String(err);
-    cropLog(`进入裁切失败: ${msg}`, "系统");
+    cropLog(`进入裁切失败 (${Math.round(performance.now() - t0)}ms): ${msg}`, "系统");
+    cropLoadDiag("失败时状态", { loadSeq });
     drawCropErrorCanvas(msg);
     setCropPanelMessage(msg);
     setStatus(`${t("pp.cropFailed")}: ${msg}`);
     updateCropModeUi();
   } finally {
+    clearTimeout(loadWatchdog);
     if (cropLayerFetchAbort === loadAbort) cropLayerFetchAbort = null;
-    cropEntering = false;
+    if (loadSeq === cropLoadSeq) cropEntering = false;
     if (loadSeq === cropLoadSeq) updateCropModeUi();
+    if (loadSeq === cropLoadSeq && cropLoading) {
+      cropLoadDiag("finally 仍 loading", { loadSeq });
+    }
   }
 }
 
@@ -4236,6 +4483,8 @@ function resetMatrixCropState() {
 }
 
 function exitCropMode() {
+  cropLog("退出裁切模式", "操作");
+  cropLoadDiag("exitCropMode");
   cropLoadSeq += 1;
   cropLayerFetchAbort?.abort();
   cropLayerFetchAbort = null;
@@ -5440,19 +5689,8 @@ async function applyInbox(btn) {
       syncCropToForm();
     }
     applyPropsFromForm();
-    if (subjectMode === "source") {
-      const wIn = $("#pp-canvas-w");
-      const hIn = $("#pp-canvas-h");
-      if (wIn && hIn) {
-        const rawW = parseCanvasFieldValue(wIn.value);
-        const rawH = parseCanvasFieldValue(hIn.value);
-        if (rawW == null || rawH == null || rawW < 32 || rawW > 4096 || rawH < 32 || rawH > 4096) {
-          throw new Error(t("pp.canvasSizeInvalid"));
-        }
-        setStackCanvasSize(rawW, rawH);
-        wIn.value = String(rawW);
-        hIn.value = String(rawH);
-      }
+    if (subjectMode === "inbox" || subjectMode === "source") {
+      commitCanvasResizeFromInputs();
     }
     await API.put(`/api/assets/${assetId}/postprocess`, postprocessSaveBody());
     stackPersistDirty = false;
@@ -5567,7 +5805,7 @@ async function smartSplitSubject(btn) {
     await API.put(`/api/assets/${assetId}/postprocess`, postprocessSaveBody());
     const r = await API.post(
       `/api/assets/${encodeURIComponent(assetId)}/postprocess/smart-split`,
-      previewBody({ min_area: 64, alpha_threshold: 8 }),
+      previewBody({ min_area: 32, alpha_threshold: 8 }),
     );
     if (r.stack) stack = r.stack;
     const firstNew = r.new_layer_ids?.[0];
@@ -5655,7 +5893,10 @@ async function autoTrimLayerAlpha(btn) {
     setStatus(t("pp.autoCropExitCropMode"));
     return;
   }
-  if (cropEntering || cropLoading) exitCropMode();
+  if (cropEntering || cropLoading) {
+    cropLog("自适应裁切前清理残留裁切加载状态", "系统");
+    exitCropMode();
+  }
   await withBtnBusy(btn || $("#pp-auto-crop"), async () => {
     if (rotationPreviewState.active) await commitRotationPreview();
     await pushHistoryBefore({ includeImages: true });
@@ -5663,19 +5904,25 @@ async function autoTrimLayerAlpha(btn) {
     invalidateCropLayerCache(layer.id);
     await persistStackNow();
     setStatus(t("pp.autoCropApplying"));
+    cropLog(`自适应裁切开始: ${layer.name || layer.id}`, "操作");
     const r = await API.post(
       `/api/assets/${encodeURIComponent(assetId)}/postprocess/trim-layer-alpha`,
       { ...previewBody(), layer_id: layer.id },
     );
     if (r.unchanged) {
+      cropLog("自适应裁切: 无变化", "操作");
       setStatus(t("pp.autoCropUnchanged"));
       return;
     }
     if (r.stack) stack = r.stack;
     exitCropMode();
     invalidateCropLayerCache(layer.id);
+    cropLog(
+      `自适应裁切完成: ${r.width}×${r.height} canvas=${r.canvas?.canvas_width}×${r.canvas?.canvas_height}`,
+      "操作",
+    );
     fillProps();
-    fillCanvasSizeInputs();
+    fillCanvasResizeInputs();
     updatePostprocessMeta();
     await fetchBounds();
     await refreshPreview({ skipInboxSync: true });
@@ -6155,15 +6402,6 @@ function updatePostprocessActions() {
   if (restoreBtn) {
     restoreBtn.hidden = subjectMode === "source" || subjectMode === "unity";
   }
-  const canvasPanel = $("#pp-canvas-size-panel");
-  if (canvasPanel) {
-    const show = subjectMode === "source";
-    canvasPanel.hidden = !show;
-    if (show) {
-      ensureCanvasSizeInputsEnabled();
-      fillCanvasSizeInputs();
-    }
-  }
 }
 
 function updateMasterEditWarning() {
@@ -6209,9 +6447,6 @@ async function bootstrap() {
   updatePostprocessMeta();
 
   stack = pp.stack;
-  if (pp.image_size?.width > 0 && pp.image_size?.height > 0) {
-    setStackCanvasSize(pp.image_size.width, pp.image_size.height);
-  }
   syncBoundsCanvasFromStack();
   restoreSessionSelection();
   const subj = stack.layers?.find((l) => l.is_subject);
@@ -6243,7 +6478,7 @@ async function bootstrap() {
   bindKeyControls();
   bindEscapeHandler();
   bindHistoryControls();
-  bindCanvasSizeControls();
+  bindCanvasResizeControls();
   bindSubjectControls();
   bindPostprocessPathFields();
   resetHistory();

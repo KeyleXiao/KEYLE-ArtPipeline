@@ -134,6 +134,7 @@
               <img id="preview-img" alt="" draggable="false" hidden />
             </div>
             <div class="preview-zoom-badge" id="preview-zoom-label" hidden aria-hidden="true">100%</div>
+            <div class="preview-live-badge hidden" id="preview-live-badge" data-i18n="preview.liveGen">采样预览</div>
             <div class="preview-loading" id="preview-loading" hidden aria-hidden="true">
               <div class="fx-orbit-loader" aria-hidden="true"><span></span></div>
               <span class="fx-loading-label" data-i18n="preview.loading">加载中…</span>
@@ -515,22 +516,35 @@
                 <div class="radio-seg gen-mode-seg" role="radiogroup" id="cloud-gen-mode-seg">
                   <label class="radio-seg-item">
                     <input type="radio" name="cloud_gen_mode" value="text_to_image" checked />
-                    <span class="radio-seg-label" data-i18n="form.genModeTextToImage">文生图</span>
+                    <span class="radio-seg-label" data-i18n="form.genModeTextToImage" data-cloud-mode="text_to_image">文生图</span>
                   </label>
                   <label class="radio-seg-item">
                     <input type="radio" name="cloud_gen_mode" value="image_to_image" />
-                    <span class="radio-seg-label" data-i18n="form.genModeImageToImage">图生图</span>
+                    <span class="radio-seg-label" data-i18n="form.genModeImageToImage" data-cloud-mode="image_to_image">图生图</span>
                   </label>
                   <label class="radio-seg-item">
                     <input type="radio" name="cloud_gen_mode" value="image_edit" />
-                    <span class="radio-seg-label" data-i18n="form.genModeImageEdit">图像编辑</span>
+                    <span class="radio-seg-label" data-i18n="form.genModeImageEdit" data-cloud-mode="image_edit">图像编辑</span>
                   </label>
                 </div>
                 <p class="settings-hint muted sm" id="cloud-gen-mode-desc"></p>
+                <p class="settings-hint muted sm hidden settings-hint--warn" id="cloud-volc-size-hint" role="status"></p>
+                <div id="cloud-provider-api-detail" class="pp-field-block hidden" aria-live="polite">
+                  <p class="settings-subhead sm" id="cloud-api-detail-title" data-i18n="form.cloudApiDetailTitle">云 API 对照</p>
+                  <p class="settings-hint muted sm" id="cloud-provider-api-detail-body"></p>
+                </div>
+                <div id="cloud-volc-output-section" class="gen-field hidden">
+                  <label class="gen-field">
+                    <span id="cloud-output-count-label" data-i18n="form.volcOutputCount">输出张数</span>
+                    <input type="number" id="cloud-output-count" min="1" max="15" step="1" value="1" />
+                  </label>
+                  <p class="settings-hint muted sm" id="cloud-volc-output-hint"></p>
+                </div>
                 <div id="cloud-ref-panel" class="gen-ref-panel hidden">
                   <div id="cloud-ref-image-section" class="ref-path-block hidden">
                     <div class="ref-path-head">
-                      <span class="ref-path-title" data-i18n="form.refImage">参考图</span>
+                      <span class="ref-path-title" id="cloud-ref-image-title" data-i18n="form.refImage">参考图</span>
+                      <span class="ref-path-tag hidden" id="cloud-ref-image-tag"></span>
                     </div>
                     <div class="ref-path-picker">
                       <input type="text" id="cloud-ref-image-path" class="ref-path-input" data-path-field data-path-kind="file" data-path-base="art" data-i18n-placeholder="form.refImagePlaceholder" spellcheck="false" />
@@ -539,17 +553,30 @@
                   <div id="cloud-edit-source-section" class="ref-path-block ref-path-readonly hidden">
                     <div class="ref-path-head">
                       <span class="ref-path-title" data-i18n="form.redrawSource">底图</span>
-                      <span class="ref-path-tag" data-i18n="form.redrawSourceTag">source 原图</span>
+                      <span class="ref-path-tag" id="cloud-edit-source-tag" data-i18n="form.redrawSourceTagInbox">inbox 优先</span>
                     </div>
                     <div class="ref-path-display" id="cloud-edit-source-path">—</div>
                   </div>
+                  <div id="cloud-ref-images-extra-section" class="ref-path-block hidden">
+                    <div class="ref-path-head">
+                      <span class="ref-path-title" id="cloud-extra-refs-title" data-i18n="form.volcExtraRefs">附加参考图</span>
+                      <span class="ref-path-tag" id="cloud-extra-refs-tag" data-i18n="form.volcExtraRefsTag">多图融合</span>
+                    </div>
+                    <label class="gen-field gen-field--full">
+                      <textarea id="cloud-ref-images-extra" rows="3" spellcheck="false" data-i18n-placeholder="form.volcExtraRefsPlaceholder"></textarea>
+                    </label>
+                    <p class="settings-hint muted sm" id="cloud-extra-refs-hint"></p>
+                  </div>
+                  <div id="cloud-strength-field">
                   <label class="gen-field denoise-field">
-                    <span data-i18n="form.cloudStrength">参考强度</span>
+                    <span id="cloud-strength-label" data-i18n="form.cloudStrength">参考强度</span>
                     <div class="denoise-row">
                       <input type="range" id="cloud-strength-range" min="0.01" max="1" step="0.01" value="0.65" />
                       <input type="number" id="cloud-strength" min="0.01" max="1" step="0.01" value="0.65" />
                     </div>
                   </label>
+                  <p class="settings-hint muted sm" id="cloud-strength-hint" data-i18n="form.cloudStrengthHint">图生图 / 图像编辑时生效；越高改动越大。</p>
+                  </div>
                   <p class="settings-hint muted sm" id="cloud-gen-ref-hint"></p>
                 </div>
               </div>

@@ -19,6 +19,9 @@ class JobState:
     run_id: int = 0
     progress: dict[str, Any] = field(default_factory=dict)
     cancel_requested: bool = False
+    live_preview: bytes = field(default_factory=bytes)
+    live_preview_mime: str = "image/jpeg"
+    live_preview_rev: int = 0
 
 
 @dataclass
@@ -68,6 +71,15 @@ class PipelineRunner:
                 snap["cloud_tasks"] = list(self.state.progress.get("cloud_tasks") or [])
             return snap
 
+    def live_preview_bytes(self) -> tuple[bytes, str, int]:
+        with self._lock:
+            return self.state.live_preview, self.state.live_preview_mime, self.state.live_preview_rev
+
+    def _clear_live_preview(self) -> None:
+        self.state.live_preview = b""
+        self.state.live_preview_mime = "image/jpeg"
+        self.state.live_preview_rev = 0
+
     def cancel(self) -> None:
         from pipeline_core import PipelineCore
 
@@ -99,11 +111,25 @@ class PipelineRunner:
             self.state.kind = kind if busy else ""
             if busy:
                 self.state.progress = {}
+                self._clear_live_preview()
             if not busy:
                 self.state.cancel_requested = False
+                self._clear_live_preview()
 
     def _set_progress(self, info: dict[str, Any]) -> None:
         with self._lock:
+            if info.get("kind") == "preview":
+                raw = info.get("image_bytes")
+                if isinstance(raw, (bytes, bytearray)) and raw:
+                    self.state.live_preview = bytes(raw)
+                    self.state.live_preview_mime = str(info.get("mime") or "image/jpeg")
+                    self.state.live_preview_rev += 1
+                prev = dict(self.state.progress)
+                merged = dict(prev)
+                merged["preview_rev"] = self.state.live_preview_rev
+                merged["preview_available"] = self.state.live_preview_rev > 0
+                self.state.progress = merged
+                return
             if info.get("kind") == "batch":
                 self.state.progress = dict(info)
                 return
@@ -168,6 +194,7 @@ class PipelineRunner:
                         self.state.kind = req.kind
                         self.state.cancel_requested = False
                         self.state.progress = {}
+                        self._clear_live_preview()
                     self._set_progress({"kind": "status", "message": "任务启动中…"})
                     try:
                         if req.kind == "generate":

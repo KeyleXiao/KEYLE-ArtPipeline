@@ -15,10 +15,15 @@
   --radius-sm: 8px;
   --font: "Inter", system-ui, -apple-system, sans-serif;
   --shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
-  --scrollbar-size: 5px;
-  --scrollbar-thumb: rgba(255, 255, 255, 0.14);
-  --scrollbar-thumb-hover: rgba(255, 255, 255, 0.28);
-  --scrollbar-thumb-active: rgba(99, 102, 241, 0.55);
+  /* 全局滚动条 · 深色 UI */
+  --scrollbar-size: 8px;
+  --scrollbar-size-compact: 6px;
+  --scrollbar-track: rgba(255, 255, 255, 0.05);
+  --scrollbar-track-edge: rgba(255, 255, 255, 0.08);
+  --scrollbar-thumb: rgba(148, 163, 184, 0.38);
+  --scrollbar-thumb-hover: rgba(199, 210, 254, 0.52);
+  --scrollbar-thumb-active: rgba(99, 102, 241, 0.78);
+  --scrollbar-thumb-glow: rgba(99, 102, 241, 0.22);
   --asset-panel-w: 228px;
 }
 
@@ -28,49 +33,145 @@
   box-sizing: border-box;
 }
 
-/* 细窄现代化滚动条 · Firefox */
-* {
+/* ── 全局滚动条（Firefox + WebKit / WKWebView）── */
+html {
+  color-scheme: dark;
   scrollbar-width: thin;
-  scrollbar-color: var(--scrollbar-thumb) transparent;
+  scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
 }
 
-/* 细窄现代化滚动条 · WebKit */
+*,
+*::before,
+*::after {
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+}
+
 *::-webkit-scrollbar {
+  -webkit-appearance: none;
+  appearance: none;
   width: var(--scrollbar-size);
   height: var(--scrollbar-size);
 }
 
+*::-webkit-scrollbar-button,
+*::-webkit-scrollbar-button:single-button {
+  display: none;
+  width: 0;
+  height: 0;
+}
+
 *::-webkit-scrollbar-track {
+  background: var(--scrollbar-track);
+  border-radius: 999px;
+  margin: 2px;
+}
+
+*::-webkit-scrollbar-track-piece {
   background: transparent;
 }
 
 *::-webkit-scrollbar-thumb {
   background-color: var(--scrollbar-thumb);
   border-radius: 999px;
-  border: 1px solid transparent;
+  border: 2px solid transparent;
   background-clip: padding-box;
-  transition: background-color 0.15s ease;
+  min-height: 36px;
+  min-width: 36px;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+  transition:
+    background-color 0.18s ease,
+    box-shadow 0.18s ease;
 }
 
 *::-webkit-scrollbar-thumb:hover {
   background-color: var(--scrollbar-thumb-hover);
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.1),
+    0 0 10px var(--scrollbar-thumb-glow);
 }
 
 *::-webkit-scrollbar-thumb:active {
   background-color: var(--scrollbar-thumb-active);
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.14),
+    0 0 12px var(--scrollbar-thumb-glow);
 }
 
 *::-webkit-scrollbar-corner {
   background: transparent;
 }
 
-/* 滚动区域悬停时略提亮滑块 */
-:is(.cat-list, .asset-scroll, .tab-body, .log-body, .ai-messages, .pp-layers, .pp-props, dialog):hover {
-  scrollbar-color: var(--scrollbar-thumb-hover) transparent;
+/* 悬停滚动区域时略提亮（侧栏、表单、日志、后处理、文档等） */
+:is(
+    .cat-list,
+    .asset-scroll,
+    .tab-body,
+    .log-body,
+    .ai-messages,
+    .settings-panel,
+    .pp-layers,
+    .pp-props,
+    .pp-props-form,
+    .docs-aside-card,
+    .docs-toc,
+    .docs-article,
+    dialog,
+    textarea,
+    select[multiple]
+  ):hover {
+  scrollbar-color: var(--scrollbar-thumb-hover) var(--scrollbar-track-edge);
 }
 
-:is(.cat-list, .asset-scroll, .tab-body, .log-body, .ai-messages, .pp-layers, .pp-props, dialog):hover::-webkit-scrollbar-thumb {
+:is(
+    .cat-list,
+    .asset-scroll,
+    .tab-body,
+    .log-body,
+    .ai-messages,
+    .settings-panel,
+    .pp-layers,
+    .pp-props,
+    .pp-props-form,
+    .docs-aside-card,
+    .docs-toc,
+    .docs-article,
+    dialog,
+    textarea,
+    select[multiple]
+  ):hover::-webkit-scrollbar-track {
+  background: var(--scrollbar-track-edge);
+}
+
+:is(
+    .cat-list,
+    .asset-scroll,
+    .tab-body,
+    .log-body,
+    .ai-messages,
+    .settings-panel,
+    .pp-layers,
+    .pp-props,
+    .pp-props-form,
+    .docs-aside-card,
+    .docs-toc,
+    .docs-article,
+    dialog,
+    textarea,
+    select[multiple]
+  ):hover::-webkit-scrollbar-thumb {
   background-color: var(--scrollbar-thumb-hover);
+}
+
+/* 横向工具条、代码块等窄区域 */
+:is(.pp-toolbar, .checkpoint-row, .radio-seg, pre, .markdown-body pre)::-webkit-scrollbar {
+  height: var(--scrollbar-size-compact);
+  width: var(--scrollbar-size-compact);
+}
+
+:is(.pp-toolbar, .checkpoint-row, .radio-seg, pre, .markdown-body pre)::-webkit-scrollbar-thumb {
+  min-height: 24px;
+  min-width: 24px;
 }
 
 html,
@@ -646,6 +747,27 @@ body.is-col-resizing * {
 
 .preview-stage.has-image .preview-zoom-badge:not([hidden]) {
   opacity: 1;
+}
+
+.preview-live-badge {
+  position: absolute;
+  left: 8px;
+  top: 8px;
+  z-index: 3;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: #e8f4ff;
+  background: rgba(36, 104, 168, 0.88);
+  border: 1px solid rgba(140, 198, 255, 0.35);
+  pointer-events: none;
+  box-shadow: 0 4px 16px rgba(8, 24, 48, 0.35);
+}
+
+.preview-stage.is-live-preview .preview-zoom-badge {
+  opacity: 0;
 }
 
 .preview-placeholder {
@@ -3732,6 +3854,13 @@ dialog menu {
   --pp-acc-glow: rgba(251, 191, 36, 0.22);
 }
 
+.pp-acc--canvas {
+  --pp-acc-icon: #7dd3fc;
+  --pp-acc-border: rgba(56, 189, 248, 0.28);
+  --pp-acc-bg: linear-gradient(135deg, rgba(56, 189, 248, 0.12), rgba(14, 165, 233, 0.04)), var(--bg-elevated);
+  --pp-acc-glow: rgba(56, 189, 248, 0.24);
+}
+
 .pp-acc--export {
   --pp-acc-icon: #6ee7b7;
   --pp-acc-border: rgba(52, 211, 153, 0.28);
@@ -4029,7 +4158,6 @@ dialog menu {
   max-height: 44px;
   box-sizing: border-box;
   background: linear-gradient(180deg, rgba(255, 255, 255, 0.02), transparent);
-  scrollbar-width: thin;
 }
 
 .pp-toolbar-group {
@@ -4137,6 +4265,49 @@ dialog menu {
 
 .pp-field-block .settings-hint {
   margin-bottom: 8px;
+}
+
+.pp-canvas-size-compare {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.pp-canvas-size-chip {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 88px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.pp-canvas-size-chip--target {
+  border-color: rgba(56, 189, 248, 0.35);
+  background: rgba(56, 189, 248, 0.08);
+}
+
+.pp-canvas-size-label {
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.pp-canvas-size-chip strong {
+  font-size: 15px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+}
+
+.pp-canvas-size-arrow {
+  color: var(--text-muted);
+  font-size: 16px;
+  line-height: 1;
 }
 
 .pp-canvas-size-hint {
@@ -5302,6 +5473,13 @@ dialog menu {
 .settings-hint {
   margin: -4px 0 0;
   line-height: 1.45;
+}
+
+.settings-hint--warn {
+  color: #fbbf24;
+  border-left: 2px solid rgba(251, 191, 36, 0.45);
+  padding-left: 10px;
+  margin-top: 6px;
 }
 
 .settings-field-grid {

@@ -39,6 +39,13 @@ def _log(fn: LogFn | None, msg: str) -> None:
         print(msg)
 
 
+def _estimate_comfy_seconds(gen_w: int, gen_h: int, steps: int) -> int:
+    """按本机 MPS 历史耗时估算 ComfyUI 采样秒数（512²@35步≈40s，1024²≈3.5min）。"""
+    pixels = max(1, int(gen_w) * int(gen_h))
+    base = 52.0 * (pixels / (512 * 512)) * (max(int(steps), 1) / 35.0)
+    return max(30, int(base))
+
+
 def resolve_checkpoint(requested: str, available: list[str]) -> str:
     if not available:
         raise ComfyUiError("ComfyUI 未返回任何 checkpoint")
@@ -214,14 +221,23 @@ class PipelineCore:
 
         mode_note = f" img2img denoise={denoise}" if gen_mode in GEN_MODES_IMG2IMG else ""
         lora_note = f" lora={lora_name}@{lora_strength}" if lora_name else ""
+        expected_s = _estimate_comfy_seconds(gen_w, gen_h, steps)
         _log(
             log,
             f"生成 {asset.filename} ({gen_w}×{gen_h}→{output_w}×{output_h}) "
-            f"ckpt={ckpt}{lora_note}{mode_note} seed={seed} steps={steps} cfg={cfg}",
+            f"ckpt={ckpt}{lora_note}{mode_note} seed={seed} steps={steps} cfg={cfg} "
+            f"预计 ~{expected_s}s",
         )
         prompt_id = client.queue_prompt(workflow)
+        last_progress_log = -1
 
         def _progress(info: dict) -> None:
+            nonlocal last_progress_log
+            if info.get("kind") == "running":
+                elapsed = int(info.get("elapsed") or 0)
+                if log and elapsed >= 30 and elapsed // 30 > last_progress_log // 30:
+                    last_progress_log = elapsed
+                    _log(log, f"  ComfyUI 生成中… {elapsed}s（预计 ~{expected_s}s）")
             if progress_cb:
                 progress_cb(info)
 
@@ -229,6 +245,7 @@ class PipelineCore:
             prompt_id,
             progress_cb=_progress,
             steps_hint=steps,
+            expected_s=expected_s,
             cancel_event=self.cancel_event,
         )
         images = client.collect_output_images(history)

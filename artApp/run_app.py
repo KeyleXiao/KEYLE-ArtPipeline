@@ -105,34 +105,48 @@ def _ui_url_candidates(host: str, port: int) -> list[str]:
 
 
 def _attach_webview_watchdog(window, urls: list[str]) -> None:
-    """若导航失败，pywebview 窗口会只剩背景色；定时重试备用 URL。"""
-    state = {"idx": 0}
+    """冷启动（尤其 PyInstaller .app）时 loaded 可能晚于数秒；避免过早 load_url 打断导航。"""
 
     def on_loaded() -> None:
-        _log_startup(f"webview loaded: {urls[state['idx']]}")
+        _log_startup(f"webview loaded: {urls[0]}")
 
     window.events.loaded += on_loaded
 
     def watch() -> None:
-        time.sleep(2.5)
-        for attempt in range(len(urls) * 2):
+        start = time.time()
+        deadline = start + 35.0
+        alt_tried = False
+        while time.time() < deadline:
+            time.sleep(0.6)
             if window.events.loaded.is_set():
                 try:
                     title = window.evaluate_js("document.title || ''")
-                    if title:
-                        _log_startup(f"webview document.title={title}")
-                        return
-                except Exception:
-                    return
-            state["idx"] = (state["idx"] + 1) % len(urls)
-            next_url = urls[state["idx"]]
-            _log_startup(f"webview blank/retry #{attempt + 1} -> {next_url}")
+                    _log_startup(f"webview document.title={title or '(empty)'}")
+                except Exception as exc:
+                    _log_startup(f"webview loaded eval skipped: {exc}")
+                return
             try:
-                window.load_url(next_url)
-            except Exception as exc:
-                _log_startup(f"webview load_url failed: {exc}")
-            time.sleep(2.5)
-        _log_startup("webview load gave up after retries")
+                ready = window.evaluate_js("document.readyState || ''")
+                body_children = window.evaluate_js(
+                    "document.body ? document.body.childElementCount : 0"
+                )
+                if ready in ("interactive", "complete") and int(body_children or 0) > 0:
+                    _log_startup(
+                        f"webview dom ready state={ready} bodyChildren={body_children}"
+                    )
+                    return
+            except Exception:
+                pass
+            elapsed = time.time() - start
+            if elapsed >= 10.0 and not alt_tried and len(urls) > 1:
+                alt_tried = True
+                alt = urls[1]
+                _log_startup(f"webview slow after {elapsed:.1f}s; try alt url {alt}")
+                try:
+                    window.load_url(alt)
+                except Exception as exc:
+                    _log_startup(f"webview alt load_url failed: {exc}")
+        _log_startup("webview load gave up after 35s (see ~/Library/Application Support/ArtPipeline Studio/startup.log)")
 
     threading.Thread(target=watch, daemon=True, name="webview-watch").start()
 

@@ -65,6 +65,8 @@ def _asset_dict(a: Any, *, full: bool = False) -> dict[str, Any]:
         "cloud_prompt": getattr(a, "cloud_prompt", ""),
         "cloud_negative": getattr(a, "cloud_negative", ""),
         "cloud_strength": getattr(a, "cloud_strength", 0.65),
+        "cloud_output_count": int(getattr(a, "cloud_output_count", 1) or 1),
+        "cloud_ref_images_extra": getattr(a, "cloud_ref_images_extra", ""),
         "checkpoint": getattr(a, "checkpoint", "") or "",
         "checkpoint_effective": effective_ckpt,
         "is_cloud_model": is_cloud_checkpoint(effective_ckpt),
@@ -187,6 +189,8 @@ class AssetUpdateBody(BaseModel):
     cloud_prompt: str | None = None
     cloud_negative: str | None = None
     cloud_strength: float | None = None
+    cloud_output_count: int | None = None
+    cloud_ref_images_extra: str | None = None
 
 
 class LayerMatteBody(BaseModel):
@@ -606,7 +610,12 @@ def comfyui_status() -> dict[str, Any]:
     from pipeline_core import PipelineCore
 
     ok, msg = PipelineCore(get_config_manager()).test_comfyui()
-    return {"ok": ok, "message": msg}
+    out: dict[str, Any] = {"ok": ok, "message": msg}
+    if ok:
+        out["live_preview_hint"] = (
+            "实时采样预览需 ComfyUI 以 --preview-method auto（或 taesd）启动"
+        )
+    return out
 
 
 @router.get("/comfyui/checkpoints")
@@ -625,22 +634,40 @@ def cloud_models() -> dict[str, Any]:
     from cloud.registry import cloud_gen_modes, list_cloud_models, load_registry
 
     reg = load_registry()
+    providers: dict[str, Any] = {}
+    for pid, prov in (reg.get("providers") or {}).items():
+        entry: dict[str, Any] = {}
+        for key in ("label_zh", "label_en", "size_constraints"):
+            if key in prov:
+                entry[key] = prov[key]
+        if entry:
+            providers[pid] = entry
     return {
         "models": list_cloud_models(),
         "gen_modes": cloud_gen_modes(),
+        "providers": providers,
         "defaults": reg.get("defaults") or {},
     }
 
 
 @router.get("/generation/models")
 def generation_models() -> dict[str, Any]:
-    from cloud.registry import list_cloud_models
+    from cloud.registry import list_cloud_models, load_registry
 
     local = list_checkpoints()
     cloud = list_cloud_models()
+    reg = load_registry()
+    providers: dict[str, Any] = {}
+    for pid, prov in (reg.get("providers") or {}).items():
+        entry: dict[str, Any] = {}
+        for key in ("label_zh", "label_en", "size_constraints"):
+            if key in prov:
+                entry[key] = prov[key]
+        if entry:
+            providers[pid] = entry
     return {
         "local": local,
-        "cloud": {"models": cloud},
+        "cloud": {"models": cloud, "providers": providers},
     }
 
 
@@ -684,6 +711,14 @@ def cloud_verify(body: dict[str, Any]) -> dict[str, Any]:
 @router.get("/jobs/status")
 def job_status() -> dict[str, Any]:
     return pipeline_runner.progress_snapshot()
+
+
+@router.get("/jobs/live-preview")
+def job_live_preview() -> Response:
+    data, mime, _rev = pipeline_runner.live_preview_bytes()
+    if not data:
+        raise HTTPException(404, "当前无采样预览")
+    return Response(content=data, media_type=mime, headers={"Cache-Control": "no-store"})
 
 
 @router.post("/jobs/cancel")
@@ -1112,6 +1147,10 @@ def update_asset(asset_id: str, body: AssetUpdateBody) -> dict[str, Any]:
         if s < 0.01 or s > 1.0:
             raise HTTPException(400, "cloud_strength 须在 0.01–1.0")
         asset.cloud_strength = s
+    if body.cloud_output_count is not None:
+        asset.cloud_output_count = max(1, min(15, int(body.cloud_output_count)))
+    if body.cloud_ref_images_extra is not None:
+        asset.cloud_ref_images_extra = body.cloud_ref_images_extra.strip()
     config.sync_asset_prompt_fields(asset)
     if asset.width < 32 or asset.height < 32 or asset.width > 4096 or asset.height > 4096:
         raise HTTPException(400, "尺寸须在 32–4096")
@@ -1295,6 +1334,7 @@ def _import_asset_image(
 async def import_assets(
     category: str = Form(...),
     gen_mode: str = Form("txt2img"),
+    replace_asset_ids: str = Form(""),
     files: list[UploadFile] = File(...),
 ) -> dict[str, Any]:
     if not category.strip():
@@ -1305,11 +1345,21 @@ async def import_assets(
     if not config.category_by_id(category):
         raise HTTPException(404, f"未知分类: {category}")
 
+    replace_ids = {x.strip() for x in replace_asset_ids.split(",") if x.strip()}
     created: list[dict[str, Any]] = []
     failed: list[dict[str, str]] = []
+    trashed: list[dict[str, Any]] = []
     for upload in files:
         raw_name = Path(upload.filename or "import.png").name
         try:
+            target_name = _normalize_import_filename(raw_name)
+            existing = config.asset_by_filename(target_name)
+            if existing:
+                if existing.id not in replace_ids:
+                    failed.append({"filename": raw_name, "error": f"文件名已存在: {target_name}"})
+                    continue
+                trashed.append(config.move_asset_to_trash(existing.id))
+                replace_ids.discard(existing.id)
             content = await upload.read()
             asset = _import_asset_image(
                 config,
@@ -1324,16 +1374,25 @@ async def import_assets(
         except OSError as exc:
             failed.append({"filename": raw_name, "error": f"写入失败: {exc}"})
 
-    if created:
+    if created or trashed:
         reload_config_manager()
-        log_bus.log(
-            f"批量导入 {len(created)} 个资源 → 分类 {category}"
-            + (f"（{len(failed)} 失败）" if failed else ""),
-            kind="操作",
-        )
+        if trashed:
+            names = ", ".join(t["filename"] for t in trashed)
+            log_bus.log(f"导入替换：{len(trashed)} 个旧资源已移入回收站（{names}）", kind="操作")
+        if created:
+            log_bus.log(
+                f"批量导入 {len(created)} 个资源 → 分类 {category}"
+                + (f"（{len(failed)} 失败）" if failed else ""),
+                kind="操作",
+            )
     if not created and failed:
         raise HTTPException(400, failed[0]["error"])
-    return {"created": created, "failed": failed, "count": len(created)}
+    return {
+        "created": created,
+        "failed": failed,
+        "trashed": trashed,
+        "count": len(created),
+    }
 
 
 @router.delete("/assets/{asset_id}")
@@ -1984,23 +2043,37 @@ def _sync_stack_canvas_to_subject_image(
         ih = int(crop.h)
 
     cw, ch = int(stack.canvas_width), int(stack.canvas_height)
+    asset_w, asset_h = int(asset.width), int(asset.height)
     single_subject = _is_single_subject_stack(stack)
     default_layout = _subject_layer_has_default_layout(subj)
 
     changed = False
-    if cw != iw or ch != ih:
+    stack.edit_subject = subject_key
+    canvas_resized_by_sync = False
+
+    if cw == iw and ch == ih:
+        report_w, report_h = iw, ih
+    elif (cw, ch) == (asset_w, asset_h):
+        # 资源登记尺寸与 stack 一致，但 PNG 像素已变（外部换图）→ 跟随 PNG
         stack.canvas_width = iw
         stack.canvas_height = ih
+        canvas_resized_by_sync = True
         changed = True
+        report_w, report_h = iw, ih
+    else:
+        # 用户在后处理中自定义了画布尺寸（尚未或已写入 PNG）→ 保留 stack 画布
+        report_w, report_h = cw, ch
 
-    stack.edit_subject = subject_key
-    if single_subject and (changed or not default_layout):
+    if canvas_resized_by_sync and single_subject:
+        _reset_subject_layer_transform_to_default(subj)
+        changed = True
+    elif cw == iw and ch == ih and single_subject and not default_layout:
         _reset_subject_layer_transform_to_default(subj)
         changed = True
 
     if changed and persist:
         config.set_postprocess_stack(asset.id, stack)
-    return changed, iw, ih
+    return changed, report_w, report_h
 
 
 @router.get("/assets/{asset_id}/postprocess")
@@ -2621,7 +2694,7 @@ def subject_raw_png(asset_id: str, subject: str | None = None) -> Response:
     """主体原图 PNG（裁切编辑器用；subject 决定读 source / inbox / unity）。"""
     import io
 
-    from postprocess.models import ASSET_SUBJECT_SOURCE
+    from PIL import Image
 
     config = get_config_manager()
     asset = config.asset_by_id(asset_id)
@@ -2629,12 +2702,20 @@ def subject_raw_png(asset_id: str, subject: str | None = None) -> Response:
         raise HTTPException(404, f"资源不存在: {asset_id}")
     if not subject:
         _ensure_inbox_for_postprocess(config, asset)
-    resolver = _pp_resolver(config, asset, subject)
-    raw = resolver.resolve(ASSET_SUBJECT_SOURCE)
-    if raw is None:
+    path = _resolve_subject_path(config, asset, subject)
+    if not path or not path.is_file():
         raise HTTPException(404, "无主体原图")
+    if path.suffix.lower() == ".png":
+        try:
+            data = path.read_bytes()
+            if len(data) >= 8:
+                return Response(content=data, media_type="image/png")
+        except OSError:
+            pass
+    with Image.open(path) as im:
+        rgba = im.convert("RGBA")
     buf = io.BytesIO()
-    raw.save(buf, format="PNG", optimize=True)
+    rgba.save(buf, format="PNG", compress_level=1, optimize=False)
     return Response(content=buf.getvalue(), media_type="image/png")
 
 
@@ -2774,6 +2855,13 @@ def apply_postprocess(
     config.set_postprocess_stack(asset_id, stack)
     reload_config_manager()
     mode = normalize_edit_subject(body.get("subject_path"))
+    if (
+        not size_synced
+        and mode == "inbox"
+        and _stack_canvas_differs_from_asset(asset, stack)
+    ):
+        size_synced = _sync_asset_dimensions_from_stack(config, asset, stack)
+        reload_config_manager()
     if canvas_written and mode == "source":
         log_bus.log(
             f"后处理已写入 source（画布 {stack.canvas_width}×{stack.canvas_height}）并更新 inbox: {asset.filename}",
@@ -2850,7 +2938,7 @@ def smart_split_postprocess(asset_id: str, body: dict[str, Any]) -> dict[str, An
             resolver,
             layers_dir=layers_dir,
             alpha_threshold=int(body.get("alpha_threshold", 8)),
-            min_area=int(body.get("min_area", 64)),
+            min_area=int(body.get("min_area", 32)),
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc

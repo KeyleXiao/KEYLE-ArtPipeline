@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import struct
 import threading
 import time
 import urllib.error
@@ -18,6 +19,65 @@ ProgressCallback = Callable[[dict[str, Any]], None]
 
 class ComfyUiError(RuntimeError):
     pass
+
+
+_PREVIEW_EVENT_UNENCODED = 1
+_PREVIEW_EVENT_LATENT = 2
+_PREVIEW_EVENT_WITH_METADATA = 4
+_PREVIEW_THROTTLE_S = 0.45
+_WS_FEATURE_FLAGS = json.dumps(
+    {"type": "feature_flags", "data": {"supports_preview_metadata": True}}
+)
+
+
+def _mime_for_image(data: bytes) -> str:
+    if data.startswith(b"\xff\xd8"):
+        return "image/jpeg"
+    if data.startswith(b"\x89PNG"):
+        return "image/png"
+    return "image/jpeg"
+
+
+def _parse_preview_frame(data: bytes) -> tuple[bytes, str] | None:
+    """解析 ComfyUI WebSocket 二进制预览帧。"""
+    if len(data) < 8:
+        return None
+    event_type = struct.unpack_from(">I", data, 0)[0]
+    if event_type in (_PREVIEW_EVENT_UNENCODED, _PREVIEW_EVENT_LATENT):
+        if len(data) < 12:
+            return None
+        fmt = struct.unpack_from(">I", data, 4)[0]
+        body = data[8:]
+        if not body:
+            return None
+        mime = {1: "image/jpeg", 2: "image/png"}.get(fmt) or _mime_for_image(body)
+        return body, mime
+    if event_type == _PREVIEW_EVENT_WITH_METADATA:
+        if len(data) < 12:
+            return None
+        meta_len = struct.unpack_from(">I", data, 4)[0]
+        meta_end = 8 + meta_len
+        if meta_end > len(data):
+            return None
+        try:
+            meta = json.loads(data[8:meta_end])
+        except json.JSONDecodeError:
+            meta = {}
+        image_bytes = data[meta_end:]
+        if not image_bytes:
+            return None
+        mime = str(meta.get("image_type") or "").strip() or _mime_for_image(image_bytes)
+        return image_bytes, mime
+    body = data[8:]
+    if len(body) >= 4 and (body[:2] == b"\xff\xd8" or body[:4] == b"\x89PNG"):
+        return body, _mime_for_image(body)
+    for i in range(1, min(len(data) - 4, 128)):
+        chunk = data[i:]
+        if chunk[:2] == b"\xff\xd8":
+            return chunk, "image/jpeg"
+        if chunk[:4] == b"\x89PNG":
+            return chunk, "image/png"
+    return None
 
 
 class ComfyUiClient:
@@ -90,6 +150,7 @@ class ComfyUiClient:
         poll_s: float = 0.5,
         progress_cb: ProgressCallback | None = None,
         steps_hint: int = 35,
+        expected_s: int = 240,
         cancel_event: threading.Event | None = None,
     ) -> dict:
         stop_ws = threading.Event()
@@ -137,10 +198,17 @@ class ComfyUiClient:
                     state, pos = self._prompt_queue_state(prompt_id, q)
                     if state == "running":
                         none_streak = 0
-                        msg = f"ComfyUI 生成中 · {elapsed}s"
-                        if elapsed >= 60:
-                            msg += "（首次加载大模型可能较慢）"
-                        progress_cb({"kind": "running", "message": msg, "elapsed": elapsed})
+                        msg = f"ComfyUI 生成中 · {elapsed}s / 预计 ~{expected_s}s"
+                        if elapsed >= 60 and elapsed < expected_s:
+                            msg += "（MPS 大图采样较慢，请稍候）"
+                        progress_cb(
+                            {
+                                "kind": "running",
+                                "message": msg,
+                                "elapsed": elapsed,
+                                "expected_s": expected_s,
+                            }
+                        )
                     elif state == "pending":
                         none_streak = 0
                         progress_cb(
@@ -185,16 +253,47 @@ class ComfyUiClient:
 
         ws_url = self.base_url.replace("https://", "wss://").replace("http://", "ws://")
         ws_url = f"{ws_url}/ws?clientId={self.client_id}"
+        preview_lock = threading.Lock()
+        last_preview_at = 0.0
 
-        def on_message(_ws: Any, message: str) -> None:
-            if stop_event.is_set():
-                return
+        def _emit_preview(image_bytes: bytes, mime: str) -> None:
+            nonlocal last_preview_at
+            now = time.time()
+            with preview_lock:
+                if now - last_preview_at < _PREVIEW_THROTTLE_S:
+                    return
+                last_preview_at = now
+            progress_cb(
+                {
+                    "kind": "preview",
+                    "image_bytes": image_bytes,
+                    "mime": mime,
+                }
+            )
+
+        def _handle_json_message(message: str) -> None:
             try:
                 data = json.loads(message)
             except json.JSONDecodeError:
                 return
             typ = data.get("type")
             payload = data.get("data") or {}
+            if typ == "progress_state":
+                nodes = payload.get("nodes") or {}
+                for node in nodes.values():
+                    if node.get("prompt_id") not in (None, prompt_id):
+                        continue
+                    if str(node.get("state") or "").lower() != "running":
+                        continue
+                    progress_cb(
+                        {
+                            "kind": "progress",
+                            "value": int(node.get("value", 0)),
+                            "max": max(int(node.get("max", 1)), 1),
+                            "message": "采样中",
+                        }
+                    )
+                    return
             if payload.get("prompt_id") not in (None, prompt_id):
                 return
             if typ == "progress":
@@ -217,11 +316,44 @@ class ComfyUiClient:
                 if status.get("exec_info", {}).get("queue_remaining") is not None:
                     progress_cb({"kind": "status", "message": "ComfyUI 就绪"})
 
+        def on_open(ws: Any) -> None:
+            try:
+                ws.send(_WS_FEATURE_FLAGS)
+            except Exception:
+                pass
+
+        def on_message(_ws: Any, message: str) -> None:
+            if stop_event.is_set():
+                return
+            _handle_json_message(message)
+
+        def on_data(_ws: Any, message: bytes, data_type: int, _continue: bool, _fin: bool) -> None:
+            if stop_event.is_set():
+                return
+            if data_type == 1:
+                try:
+                    _handle_json_message(message.decode("utf-8"))
+                except UnicodeDecodeError:
+                    pass
+                return
+            if data_type != 2:
+                return
+            parsed = _parse_preview_frame(message)
+            if parsed:
+                image_bytes, mime = parsed
+                _emit_preview(image_bytes, mime)
+
         def on_error(_ws: Any, error: Any) -> None:
             if not stop_event.is_set():
                 progress_cb({"kind": "status", "message": f"WS: {error}"})
 
-        ws_app = websocket.WebSocketApp(ws_url, on_message=on_message, on_error=on_error)
+        ws_app = websocket.WebSocketApp(
+            ws_url,
+            on_open=on_open,
+            on_message=on_message,
+            on_data=on_data,
+            on_error=on_error,
+        )
         while not stop_event.is_set():
             ws_app.run_forever(ping_interval=20, ping_timeout=10)
             if stop_event.is_set():

@@ -235,6 +235,7 @@ def patch_macos_info_plist(app_path: Path) -> None:
     """
     写入 ATS，允许 WKWebView 加载本地 http://127.0.0.1。
     未配置时 pywebview 窗口可能只有深色背景（黑屏），内容区未挂上 WebView。
+    macOS 15+ 建议同时声明本地网络用途说明。
     """
     plist_path = app_path / "Contents" / "Info.plist"
     if not plist_path.is_file():
@@ -245,6 +246,10 @@ def patch_macos_info_plist(app_path: Path) -> None:
         "NSAllowsArbitraryLoads": True,
         "NSAllowsLocalNetworking": True,
     }
+    plist.setdefault(
+        "NSLocalNetworkUsageDescription",
+        "ArtPipeline Studio 通过本机 HTTP 服务加载界面。",
+    )
     plist.setdefault("LSMinimumSystemVersion", "11.0")
     plist.setdefault("NSHighResolutionCapable", True)
     with plist_path.open("wb") as handle:
@@ -334,6 +339,11 @@ def build_pyinstaller(*, clean: bool = True, python: str | None = None, target: 
 
     artifact = collect_artifact(target=target)
     if target == "mac":
+        # dist 与 release 根下的 .app 都需 ATS；否则直接打开 dist 会黑屏
+        dist_app = DIST_DIR / f"{APP_NAME}.app"
+        if dist_app.is_dir():
+            patch_macos_info_plist(dist_app)
+            adhoc_sign_macos_app(dist_app)
         package_macos_app_zip(artifact)
     write_release_readme(artifact, portable=False, target=target)
     return artifact

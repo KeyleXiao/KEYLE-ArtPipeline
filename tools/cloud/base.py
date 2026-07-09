@@ -29,6 +29,8 @@ class CloudGenerateRequest:
     ref_image_path: Path | None
     base_image_path: Path | None
     api_keys: dict[str, str]
+    extra_ref_paths: list[Path] | None = None
+    output_count: int = 1
 
 
 @dataclass
@@ -36,6 +38,7 @@ class CloudGenerateResult:
     ok: bool
     message: str
     png_bytes: bytes | None = None
+    extra_png_bytes: list[bytes] | None = None
 
 
 class CloudProvider:

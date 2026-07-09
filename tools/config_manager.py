@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -172,6 +174,8 @@ class Asset:
     cloud_prompt: str = ""
     cloud_negative: str = ""
     cloud_strength: float = DEFAULT_CLOUD_STRENGTH
+    cloud_output_count: int = 1
+    cloud_ref_images_extra: str = ""
 
     @property
     def size(self) -> int:
@@ -395,6 +399,8 @@ class ConfigManager:
                 cloud_prompt=str(raw.get("cloud_prompt", "")),
                 cloud_negative=str(raw.get("cloud_negative", "")),
                 cloud_strength=float(raw.get("cloud_strength", DEFAULT_CLOUD_STRENGTH)),
+                cloud_output_count=max(1, min(15, int(raw.get("cloud_output_count", 1) or 1))),
+                cloud_ref_images_extra=str(raw.get("cloud_ref_images_extra", "")),
             )
             out.append(a)
         self._assets_cache = out
@@ -545,6 +551,8 @@ class ConfigManager:
             "cloud_prompt": asset.cloud_prompt,
             "cloud_negative": asset.cloud_negative,
             "cloud_strength": asset.cloud_strength,
+            "cloud_output_count": int(getattr(asset, "cloud_output_count", 1) or 1),
+            "cloud_ref_images_extra": getattr(asset, "cloud_ref_images_extra", ""),
         }
         for i, raw in enumerate(self.data.get("assets", [])):
             if raw.get("id") == asset.id:
@@ -722,6 +730,51 @@ class ConfigManager:
     def delete_asset(self, asset_id: str) -> None:
         self.data["assets"] = [a for a in self.data.get("assets", []) if a.get("id") != asset_id]
         self.save()
+
+    def trash_dir(self) -> Path:
+        return self.art_root() / "trash"
+
+    def move_asset_to_trash(self, asset_id: str) -> dict[str, Any]:
+        """将资源配置移除，并把 source / inbox / unity PNG 与工作流移入 art/trash。"""
+        asset = self.asset_by_id(asset_id)
+        if not asset:
+            raise ValueError(f"资源不存在: {asset_id}")
+        cat = self.category_by_id(asset.category)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        dest_dir = self.trash_dir() / f"{stamp}_{asset.id}"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        moved_files: list[str] = []
+        src, inbox, unity = self.resolve_paths(asset)
+        for kind, path in (("source", src), ("inbox", inbox), ("unity", unity)):
+            if path.is_file():
+                dest = dest_dir / f"{kind}_{path.name}"
+                shutil.move(str(path), str(dest))
+                moved_files.append(str(dest))
+
+        wf = asset.workflow_path()
+        if wf and wf.is_file():
+            dest = dest_dir / wf.name
+            shutil.move(str(wf), str(dest))
+            moved_files.append(str(dest))
+
+        meta = {
+            "trashed_at": stamp,
+            "asset": asdict(asset),
+            "category_label": cat.label if cat else asset.category,
+            "moved_files": moved_files,
+        }
+        (dest_dir / "meta.json").write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        asset_snapshot = {"id": asset.id, "filename": asset.filename}
+        self.delete_asset(asset_id)
+        return {
+            **asset_snapshot,
+            "trash_dir": str(dest_dir),
+            "moved_files": moved_files,
+        }
 
     def delete_category(self, cat_id: str) -> int:
         if not self.category_by_id(cat_id):
